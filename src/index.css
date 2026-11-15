@@ -1,0 +1,109 @@
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap');
+@import 'tailwindcss';
+
+@layer base {
+  :root {
+    font-family: 'Manrope', sans-serif;
+    color: #172321;
+    background: #e8e9e4;
+    font-synthesis: none;
+  }
+
+  body {
+    min-width: 320px;
+    min-height: 100vh;
+  }
+
+  button {
+    cursor: pointer;
+  }
+}
+
+@layer components {
+  .avatar {
+    display: flex;
+    height: 44px;
+    width: 44px;
+    flex-shrink: 0;
+    align-items: center;
+    justify-content: center;
+    border-radius: 15px;
+    font-size: 11px;
+    font-weight: 800;
+  }
+
+  .icon-button {
+    display: flex;
+    height: 44px;
+    width: 44px;
+    flex-shrink: 0;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid #e4e3dc;
+    border-radius: 15px;
+    background: white;
+    color: #35423f;
+    transition: transform 150ms ease, background 150ms ease;
+  }
+
+  .icon-button:active {
+    transform: scale(.94);
+    background: #f0efea;
+  }
+
+  .primary-button {
+    display: flex;
+    width: 100%;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    border-radius: 17px;
+    background: #ed765f;
+    padding: 15px 18px;
+    color: white;
+    font-size: 13px;
+    font-weight: 800;
+    box-shadow: 0 10px 22px rgba(237, 118, 95, .23);
+    transition: transform 150ms ease, background 150ms ease;
+  }
+
+  .primary-button:active {
+    transform: scale(.98);
+    background: #df6954;
+  }
+
+  .field-label {
+    margin-bottom: 7px;
+    display: block;
+    font-size: 10px;
+    font-weight: 800;
+    color: #727d78;
+  }
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.no-scrollbar {
+  scrollbar-width: none;
+}
+
+@keyframes sheet-in {
+  from { transform: translate(-50%, 100%); }
+  to { transform: translate(-50%, 0); }
+}
+
+@keyframes toast-in {
+  0% { opacity: 0; transform: translate(-50%, -12px); }
+  15%, 85% { opacity: 1; transform: translate(-50%, 0); }
+  100% { opacity: 0; transform: translate(-50%, -8px); }
+}
+
+.animate-sheet {
+  animation: sheet-in 320ms cubic-bezier(.2, .8, .2, 1);
+}
+
+.animate-toast {
+  animation: toast-in 2400ms ease forwards;
+}

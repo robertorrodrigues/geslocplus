@@ -1,0 +1,12 @@
+{
+  "title": "Staywise | Gestão de temporada",
+  "language": "pt-BR",
+  "description": "Gerencie imóveis de aluguel por temporada com múltiplos proprietários, prepostos e prestadores, organizando cadastros, tarefas, checklists e comissões.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
