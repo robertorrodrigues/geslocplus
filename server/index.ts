@@ -304,16 +304,171 @@ const personSchema = z.object({
   cpfCnpj: z.string().trim().max(30).optional(),
 })
 
-const taskSchema = z.object({
-  title: z.string().trim().min(2).max(500),
+const operationTaskSchema = z
+  .object({
+    name: z.string().trim().min(2).max(160),
+    observation: z.string().trim().max(2000).default(""),
+    propertyId: positiveId,
+    startAt: z.string().datetime().nullable().optional(),
+    endAt: z.string().datetime().nullable().optional(),
+    executorType: z.enum(["administrator", "provider"]),
+    executorId: positiveId,
+    checklistIds: z
+      .array(positiveId)
+      .refine((ids) => new Set(ids).size === ids.length, {
+        message: "Não repita checklists.",
+      })
+      .default([]),
+  })
+  .superRefine((task, context) => {
+    if (
+      task.startAt &&
+      task.endAt &&
+      new Date(task.startAt).getTime() > new Date(task.endAt).getTime()
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "A data de início deve ser anterior à data de fim.",
+        path: ["endAt"],
+      })
+    }
+  })
 
-  dueAt: z.string().datetime().optional().or(z.literal("")),
+const operationTaskStatusSchema = z.object({
+  status: z.enum([
+    "iniciar",
+    "em_andamento",
+    "final_ok",
+    "final_prb",
+    "cancelada",
+  ]),
 })
+
+async function requireTaskExecutor(
+  userId: string,
+  executorType: "administrator" | "provider",
+  executorId: string,
+  client: PoolClient,
+) {
+  const result =
+    executorType === "administrator"
+      ? await client.query(
+          `SELECT id FROM proprietarios_adm
+           WHERE id = $1 AND created_by_user_id = $2`,
+          [executorId, userId],
+        )
+      : await client.query(
+          `SELECT id FROM prestadores_servico
+           WHERE id = $1 AND created_by_user_id = $2`,
+          [executorId, userId],
+        )
+
+  if (!result.rowCount) {
+    throw new ApiError(400, "O executor selecionado não foi encontrado.")
+  }
+}
+
+async function requireTaskChecklists(
+  userId: string,
+  checklistIds: string[],
+  client: PoolClient,
+) {
+  if (!checklistIds.length) return
+
+  const result = await client.query(
+    `SELECT id FROM checklists
+     WHERE id = ANY($1::bigint[])
+       AND (tipo = 'padrao'
+         OR (tipo = 'personalizado' AND created_by_user_id = $2))
+     FOR SHARE`,
+    [checklistIds, userId],
+  )
+
+  if (result.rowCount !== checklistIds.length) {
+    throw new ApiError(
+      400,
+      "Um ou mais checklists selecionados não estão disponíveis.",
+    )
+  }
+}
+
+async function syncTaskChecklists(
+  taskId: string,
+  userId: string,
+  checklistIds: string[],
+  client: PoolClient,
+) {
+  const existing = await client.query(
+    `SELECT checklist_origem_id::text AS source_id
+     FROM tarefas_operacao_checklists
+     WHERE tarefa_id = $1`,
+    [taskId],
+  )
+  const existingIds = new Set(
+    existing.rows.map((row: { source_id: string }) => row.source_id),
+  )
+  const newIds = checklistIds.filter((id) => !existingIds.has(id))
+  await requireTaskChecklists(userId, newIds, client)
+
+  if (checklistIds.length) {
+    await client.query(
+      `DELETE FROM tarefas_operacao_checklists
+       WHERE tarefa_id = $1
+         AND checklist_origem_id <> ALL($2::bigint[])`,
+      [taskId, checklistIds],
+    )
+  } else {
+    await client.query(
+      "DELETE FROM tarefas_operacao_checklists WHERE tarefa_id = $1",
+      [taskId],
+    )
+  }
+
+  for (const [position, sourceId] of checklistIds.entries()) {
+    if (existingIds.has(sourceId)) {
+      await client.query(
+        `UPDATE tarefas_operacao_checklists
+         SET posicao = $3
+         WHERE tarefa_id = $1 AND checklist_origem_id = $2`,
+        [taskId, sourceId, position],
+      )
+      continue
+    }
+
+    const copy = await client.query(
+      `INSERT INTO tarefas_operacao_checklists
+         (tarefa_id, checklist_origem_id, titulo, posicao)
+       SELECT $1, c.id, c.titulo, $3
+       FROM checklists c
+       WHERE c.id = $2
+       RETURNING id`,
+      [taskId, sourceId, position],
+    )
+    if (!copy.rowCount) {
+      throw new ApiError(400, "Um checklist selecionado não foi encontrado.")
+    }
+
+    await client.query(
+      `INSERT INTO tarefas_operacao_checklist_items
+         (tarefa_checklist_id, titulo, descricao, regra, posicao)
+       SELECT $1, titulo, descricao, regra, posicao
+       FROM checklist_items
+       WHERE checklist_id = $2
+       ORDER BY posicao, id`,
+      [copy.rows[0].id, sourceId],
+    )
+  }
+}
 
 const checklistSchema = z.object({
   title: z.string().trim().min(2).max(160),
 
   items: z.array(z.string().trim().min(1).max(160)).max(50).default([]),
+})
+
+const platformChecklistSchema = z.object({
+  title: z.string().trim().min(2).max(160),
+  items: z.array(z.string().trim().min(1).max(160)).min(1).max(50),
 })
 
 app.use(express.json({ limit: "7mb" }))
@@ -684,6 +839,69 @@ app.patch(
   }),
 )
 
+app.get(
+  "/api/platform/checklists",
+  authRequired,
+  platformAdminRequired,
+  asyncRoute(async (_req, res) => {
+    const result = await pool.query(
+      `SELECT c.id::text AS id, c.titulo AS title, c.status,
+              c.descricao AS description, c.tipo AS type,
+              coalesce((
+                SELECT json_agg(json_build_object(
+                  'id', ci.id::text, 'title', ci.titulo,
+                  'description', ci.descricao, 'rule', ci.regra
+                ) ORDER BY ci.posicao, ci.id)
+                FROM checklist_items ci WHERE ci.checklist_id = c.id
+              ), '[]'::json) AS items
+       FROM checklists c
+       WHERE c.tipo = 'padrao'
+       ORDER BY c.id DESC`,
+    )
+    res.json({ checklists: result.rows })
+  }),
+)
+
+app.post(
+  "/api/platform/checklists",
+  authRequired,
+  platformAdminRequired,
+  asyncRoute(async (req, res) => {
+    const parsed = platformChecklistSchema.safeParse(req.body)
+    if (!parsed.success) {
+      throw new ApiError(400, "Informe o nome e ao menos um item do checklist.")
+    }
+
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+
+      const checklist = await client.query(
+        `INSERT INTO checklists (titulo, status, tipo)
+         VALUES ($1, 'ativo', 'padrao')
+         RETURNING id`,
+        [parsed.data.title],
+      )
+
+      for (const [position, title] of parsed.data.items.entries()) {
+        await client.query(
+          `INSERT INTO checklist_items (checklist_id, titulo, posicao)
+           VALUES ($1, $2, $3)`,
+          [checklist.rows[0].id, title, position],
+        )
+      }
+
+      await client.query("COMMIT")
+      res.status(201).json({ id: String(checklist.rows[0].id) })
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
+  }),
+)
+
 app.use("/api", authRequired, proprietarioAdminRequired)
 
 app.get(
@@ -704,12 +922,20 @@ app.get(
 
       pool.query(
         `SELECT count(*) FILTER (
-                  WHERE lower(coalesce(status, '')) NOT IN ('concluido', 'concluída', 'concluida', 'completed', 'cancelado', 'cancelada', 'cancelled')
+                  WHERE status NOT IN ('final_ok', 'final_prb', 'cancelada')
                 )::int AS pending,
                 count(*) FILTER (
-                  WHERE lower(coalesce(status, '')) IN ('concluido', 'concluída', 'concluida', 'completed')
+                  WHERE status IN ('final_ok', 'final_prb')
                 )::int AS completed
-         FROM tarefas`,
+         FROM tarefas_operacao t
+         WHERE t.created_by_user_id = $1
+           AND EXISTS (
+             SELECT 1 FROM proprietarios_adm_imoveis pai
+             JOIN usuarios u ON u.pessoa_id = pai.proprietarios_adm_id
+             WHERE pai.imoveis_id = t.imovel_id AND u.id = $1
+               AND u.tipo_pessoa = 'proprietario_adm'
+           )`,
+        [req.user!.userId],
       ),
     ])
 
@@ -1301,85 +1527,314 @@ app.post(
 )
 
 app.get(
+  "/api/operation/tasks",
+  asyncRoute(async (req, res) => {
+    const result = await pool.query(
+      `SELECT t.id::text AS id, t.nome AS name, t.observacao AS observation,
+              t.imovel_id::text AS property_id, im.nome AS property_name,
+              t.dt_inicio AS start_at, t.dt_fim AS end_at, t.status,
+              t.executor_tipo AS executor_type,
+              coalesce(pa.id, ps.id)::text AS executor_id,
+              coalesce(pa.nome, ps.nome) AS executor_name,
+              coalesce((
+                SELECT json_agg(json_build_object(
+                  'id', tc.id::text,
+                  'source_checklist_id', tc.checklist_origem_id::text,
+                  'title', tc.titulo,
+                  'items', coalesce((
+                    SELECT json_agg(json_build_object(
+                      'id', ci.id::text, 'title', ci.titulo,
+                      'description', ci.descricao, 'rule', ci.regra,
+                      'done', ci.concluido
+                    ) ORDER BY ci.posicao, ci.id)
+                    FROM tarefas_operacao_checklist_items ci
+                    WHERE ci.tarefa_checklist_id = tc.id
+                  ), '[]'::json)
+                ) ORDER BY tc.posicao, tc.id)
+                FROM tarefas_operacao_checklists tc
+                WHERE tc.tarefa_id = t.id
+              ), '[]'::json) AS checklists
+       FROM tarefas_operacao t
+       JOIN imoveis im ON im.id = t.imovel_id
+       LEFT JOIN proprietarios_adm pa
+         ON pa.id = t.executor_administrador_id
+       LEFT JOIN prestadores_servico ps
+         ON ps.id = t.executor_prestador_id
+       WHERE t.created_by_user_id = $1
+         AND EXISTS (
+           SELECT 1 FROM proprietarios_adm_imoveis pai
+           JOIN usuarios u ON u.pessoa_id = pai.proprietarios_adm_id
+           WHERE pai.imoveis_id = t.imovel_id AND u.id = $1
+             AND u.tipo_pessoa = 'proprietario_adm'
+         )
+       ORDER BY t.dt_inicio NULLS LAST, t.id DESC`,
+      [req.user!.userId],
+    )
+    res.json({ tasks: result.rows })
+  }),
+)
+
+app.post(
+  "/api/operation/tasks",
+  asyncRoute(async (req, res) => {
+    const parsed = operationTaskSchema.safeParse(req.body)
+    if (!parsed.success) {
+      throw new ApiError(400, "Confira os dados obrigatórios da tarefa.")
+    }
+
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      await requirePropertyAccess(
+        req.user!.userId,
+        parsed.data.propertyId,
+        client,
+      )
+      await requireTaskExecutor(
+        req.user!.userId,
+        parsed.data.executorType,
+        parsed.data.executorId,
+        client,
+      )
+
+      const task = await client.query(
+        `INSERT INTO tarefas_operacao (
+           imovel_id, nome, observacao, dt_inicio, dt_fim, executor_tipo,
+           executor_administrador_id, executor_prestador_id, created_by_user_id
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING id::text AS id`,
+        [
+          parsed.data.propertyId,
+          parsed.data.name,
+          parsed.data.observation,
+          parsed.data.startAt || null,
+          parsed.data.endAt || null,
+          parsed.data.executorType,
+          parsed.data.executorType === "administrator"
+            ? parsed.data.executorId
+            : null,
+          parsed.data.executorType === "provider"
+            ? parsed.data.executorId
+            : null,
+          req.user!.userId,
+        ],
+      )
+      await syncTaskChecklists(
+        task.rows[0].id,
+        req.user!.userId,
+        parsed.data.checklistIds,
+        client,
+      )
+      await client.query("COMMIT")
+      res.status(201).json({ id: task.rows[0].id })
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
+  }),
+)
+
+app.patch(
+  "/api/operation/tasks/:id",
+  asyncRoute(async (req, res) => {
+    const id = positiveId.safeParse(req.params.id)
+    const parsed = operationTaskSchema.safeParse(req.body)
+    if (!id.success) throw new ApiError(400, "Identificador inválido.")
+    if (!parsed.success) {
+      throw new ApiError(400, "Confira os dados obrigatórios da tarefa.")
+    }
+
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      const currentTask = await client.query(
+        `SELECT id FROM tarefas_operacao
+         WHERE id = $1 AND created_by_user_id = $2
+         FOR UPDATE`,
+        [id.data, req.user!.userId],
+      )
+      if (!currentTask.rowCount) throw new ApiError(404, "Tarefa não encontrada.")
+
+      await requirePropertyAccess(
+        req.user!.userId,
+        parsed.data.propertyId,
+        client,
+      )
+      await requireTaskExecutor(
+        req.user!.userId,
+        parsed.data.executorType,
+        parsed.data.executorId,
+        client,
+      )
+      await client.query(
+        `UPDATE tarefas_operacao
+         SET imovel_id = $2, nome = $3, observacao = $4,
+             dt_inicio = $5, dt_fim = $6, executor_tipo = $7,
+             executor_administrador_id = $8, executor_prestador_id = $9
+         WHERE id = $1 AND created_by_user_id = $10`,
+        [
+          id.data,
+          parsed.data.propertyId,
+          parsed.data.name,
+          parsed.data.observation,
+          parsed.data.startAt || null,
+          parsed.data.endAt || null,
+          parsed.data.executorType,
+          parsed.data.executorType === "administrator"
+            ? parsed.data.executorId
+            : null,
+          parsed.data.executorType === "provider"
+            ? parsed.data.executorId
+            : null,
+          req.user!.userId,
+        ],
+      )
+      await syncTaskChecklists(
+        id.data,
+        req.user!.userId,
+        parsed.data.checklistIds,
+        client,
+      )
+      await client.query("COMMIT")
+      res.status(204).end()
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
+  }),
+)
+
+app.patch(
+  "/api/operation/tasks/:id/status",
+  asyncRoute(async (req, res) => {
+    const id = positiveId.safeParse(req.params.id)
+    const parsed = operationTaskStatusSchema.safeParse(req.body)
+    if (!id.success) throw new ApiError(400, "Identificador inválido.")
+    if (!parsed.success) throw new ApiError(400, "Status de tarefa inválido.")
+
+    const task = await pool.query(
+      `UPDATE tarefas_operacao t
+       SET status = $3
+       WHERE t.id = $1 AND t.created_by_user_id = $2
+         AND EXISTS (
+           SELECT 1 FROM proprietarios_adm_imoveis pai
+           JOIN usuarios u ON u.pessoa_id = pai.proprietarios_adm_id
+           WHERE pai.imoveis_id = t.imovel_id AND u.id = $2
+             AND u.tipo_pessoa = 'proprietario_adm'
+         )
+       RETURNING id`,
+      [id.data, req.user!.userId, parsed.data.status],
+    )
+    if (!task.rowCount) throw new ApiError(404, "Tarefa não encontrada.")
+    res.status(204).end()
+  }),
+)
+
+app.patch(
+  "/api/operation/tasks/:taskId/checklist-items/:itemId",
+  asyncRoute(async (req, res) => {
+    const taskId = positiveId.safeParse(req.params.taskId)
+    const itemId = positiveId.safeParse(req.params.itemId)
+    const parsed = z.object({ completed: z.boolean() }).safeParse(req.body)
+    if (!taskId.success || !itemId.success) {
+      throw new ApiError(400, "Identificador inválido.")
+    }
+    if (!parsed.success) throw new ApiError(400, "Estado do item inválido.")
+
+    const item = await pool.query(
+      `UPDATE tarefas_operacao_checklist_items ci
+       SET concluido = $3
+       WHERE ci.id = $1
+         AND EXISTS (
+           SELECT 1
+           FROM tarefas_operacao_checklists tc
+           JOIN tarefas_operacao t ON t.id = tc.tarefa_id
+           JOIN proprietarios_adm_imoveis pai ON pai.imoveis_id = t.imovel_id
+           JOIN usuarios u ON u.pessoa_id = pai.proprietarios_adm_id
+           WHERE tc.id = ci.tarefa_checklist_id
+             AND t.id = $2 AND t.created_by_user_id = $4
+             AND u.id = $4 AND u.tipo_pessoa = 'proprietario_adm'
+         )
+       RETURNING ci.id`,
+      [itemId.data, taskId.data, parsed.data.completed, req.user!.userId],
+    )
+    if (!item.rowCount) {
+      throw new ApiError(404, "Item de checklist não encontrado.")
+    }
+    res.status(204).end()
+  }),
+)
+
+app.delete(
+  "/api/operation/tasks/:id",
+  asyncRoute(async (req, res) => {
+    const id = positiveId.safeParse(req.params.id)
+    if (!id.success) throw new ApiError(400, "Identificador inválido.")
+
+    const task = await pool.query(
+      `DELETE FROM tarefas_operacao t
+       WHERE t.id = $1 AND t.created_by_user_id = $2
+         AND EXISTS (
+           SELECT 1 FROM proprietarios_adm_imoveis pai
+           JOIN usuarios u ON u.pessoa_id = pai.proprietarios_adm_id
+           WHERE pai.imoveis_id = t.imovel_id AND u.id = $2
+             AND u.tipo_pessoa = 'proprietario_adm'
+         )
+       RETURNING id`,
+      [id.data, req.user!.userId],
+    )
+    if (!task.rowCount) throw new ApiError(404, "Tarefa não encontrada.")
+    res.status(204).end()
+  }),
+)
+
+app.get(
   "/api/tasks",
 
-  asyncRoute(async (_req, res) => {
+  asyncRoute(async (req, res) => {
     const result = await pool.query(
-      `SELECT id::text AS id, coalesce(descricao, 'Tarefa') AS title,
-              'other'::text AS category, dt_inicio AS due_at, status,
-              'Operação'::text AS property_name, 'task'::text AS source,
-              lower(coalesce(status, '')) IN ('concluido', 'concluída', 'concluida', 'completed') AS done
-       FROM tarefas
-       UNION ALL
-       SELECT 'checklist:' || c.id::text, c.titulo, 'inspection'::text,
-              NULL::timestamptz, c.status, 'Checklist'::text, 'checklist'::text,
-              lower(c.status) IN ('concluido', 'concluída', 'concluida', 'completed')
+      `SELECT 'checklist:' || c.id::text AS id, c.titulo AS title,
+              'inspection'::text AS category, NULL::timestamptz AS due_at,
+              c.status, 'Checklist'::text AS property_name,
+              'checklist'::text AS source,
+              lower(c.status) IN ('concluido', 'concluída', 'concluida', 'completed') AS done
        FROM checklists c
+       WHERE c.tipo = 'personalizado' AND c.created_by_user_id = $1
        ORDER BY due_at NULLS LAST, id`,
+      [req.user!.userId],
     )
 
     res.json({ tasks: result.rows })
   }),
 )
 
-app.post(
-  "/api/tasks",
-
-  asyncRoute(async (req, res) => {
-    const parsed = taskSchema.safeParse(req.body)
-
-    if (!parsed.success) throw new ApiError(400, "Confira os dados da tarefa.")
-
-    const result = await pool.query(
-      `INSERT INTO tarefas (descricao, dt_inicio, status)
-       VALUES ($1, $2, 'pendente') RETURNING id::text AS id`,
-
-      [parsed.data.title, parsed.data.dueAt || null],
-    )
-
-    res.status(201).json({ id: result.rows[0].id })
-  }),
-)
-
 app.patch(
   "/api/tasks/:id",
-
   asyncRoute(async (req, res) => {
-    const { completed } = z.object({ completed: z.boolean() }).parse(req.body)
-
     const rawId = req.params.id
-
-    if (typeof rawId !== "string") {
-      throw new ApiError(400, "Identificador inválido.")
+    if (typeof rawId !== "string" || !rawId.startsWith("checklist:")) {
+      throw new ApiError(404, "Checklist não encontrado.")
     }
-
-    const isChecklist = rawId.startsWith("checklist:")
-
-    const id = positiveId.safeParse(
-      isChecklist ? rawId.slice("checklist:".length) : rawId,
-    )
-
+    const id = positiveId.safeParse(rawId.slice("checklist:".length))
+    const parsed = z.object({ completed: z.boolean() }).safeParse(req.body)
     if (!id.success) throw new ApiError(400, "Identificador inválido.")
+    if (!parsed.success) throw new ApiError(400, "Estado do checklist inválido.")
 
-    const result = isChecklist
-      ? await pool.query(
-          "UPDATE checklists SET status = $2 WHERE id = $1 RETURNING id",
-
-          [id.data, completed ? "concluido" : "pendente"],
-        )
-      : await pool.query(
-          "UPDATE tarefas SET status = $2 WHERE id = $1 RETURNING id",
-
-          [id.data, completed ? "concluido" : "pendente"],
-        )
-
+    const result = await pool.query(
+      `UPDATE checklists SET status = $2
+       WHERE id = $1 AND tipo = 'personalizado'
+         AND created_by_user_id = $3
+       RETURNING id`,
+      [id.data, parsed.data.completed ? "concluido" : "pendente", req.user!.userId],
+    )
     if (!result.rowCount) {
-      throw new ApiError(
-        404,
-        isChecklist ? "Checklist não encontrado." : "Tarefa não encontrada.",
-      )
+      throw new ApiError(404, "Checklist não encontrado.")
     }
-
     res.status(204).end()
   }),
 )
@@ -1387,9 +1842,26 @@ app.patch(
 app.get(
   "/api/checklists",
 
-  asyncRoute(async (_req, res) => {
-    const result = await pool.query(
+  asyncRoute(async (req, res) => {
+    const [checklists, templates] = await Promise.all([
+      pool.query(
+        `SELECT c.id::text AS id, c.titulo AS title, c.status,
+                c.modelo_padrao_id::text AS source_template_id,
+                coalesce((
+                  SELECT json_agg(json_build_object(
+                    'id', ci.id::text, 'title', ci.titulo,
+                    'description', ci.descricao, 'rule', ci.regra
+                  ) ORDER BY ci.posicao, ci.id)
+                  FROM checklist_items ci WHERE ci.checklist_id = c.id
+                ), '[]'::json) AS items
+         FROM checklists c
+         WHERE c.tipo = 'personalizado' AND c.created_by_user_id = $1
+         ORDER BY c.id DESC`,
+        [req.user!.userId],
+      ),
+      pool.query(
       `SELECT c.id::text AS id, c.titulo AS title, c.status, c.descricao AS description,
+              c.tipo AS type,
               coalesce((
                 SELECT json_agg(json_build_object(
                   'id', ci.id::text, 'title', ci.titulo,
@@ -1397,10 +1869,13 @@ app.get(
                 ) ORDER BY ci.posicao, ci.id)
                 FROM checklist_items ci WHERE ci.checklist_id = c.id
               ), '[]'::json) AS items
-       FROM checklists c ORDER BY c.id DESC`,
-    )
+       FROM checklists c
+       WHERE c.tipo = 'padrao'
+       ORDER BY c.id DESC`,
+      ),
+    ])
 
-    res.json({ checklists: result.rows })
+    res.json({ checklists: checklists.rows, templates: templates.rows })
   }),
 )
 
@@ -1420,9 +1895,11 @@ app.post(
       await client.query("BEGIN")
 
       const checklist = await client.query(
-        "INSERT INTO checklists (titulo, status) VALUES ($1, 'pendente') RETURNING id",
+        `INSERT INTO checklists (titulo, status, tipo, created_by_user_id)
+         VALUES ($1, 'pendente', 'personalizado', $2)
+         RETURNING id`,
 
-        [parsed.data.title],
+        [parsed.data.title, req.user!.userId],
       )
 
       for (const [position, title] of parsed.data.items.entries()) {
@@ -1439,6 +1916,163 @@ app.post(
     } catch (error) {
       await client.query("ROLLBACK")
 
+      throw error
+    } finally {
+      client.release()
+    }
+  }),
+)
+
+app.post(
+  "/api/checklists/:templateId/subscribe",
+
+  asyncRoute(async (req, res) => {
+    const templateId = positiveId.safeParse(req.params.templateId)
+    if (!templateId.success) {
+      throw new ApiError(400, "Identificador de checklist inválido.")
+    }
+
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+
+      const template = await client.query(
+        `SELECT id, titulo FROM checklists
+         WHERE id = $1 AND tipo = 'padrao'
+         FOR SHARE`,
+        [templateId.data],
+      )
+      if (!template.rowCount) {
+        throw new ApiError(404, "Checklist padrão não encontrado.")
+      }
+
+      const existing = await client.query(
+        `SELECT id FROM checklists
+         WHERE created_by_user_id = $1 AND modelo_padrao_id = $2
+         LIMIT 1`,
+        [req.user!.userId, templateId.data],
+      )
+      if (existing.rowCount) {
+        throw new ApiError(409, "Este checklist já está na sua lista.")
+      }
+
+      const checklist = await client.query(
+        `INSERT INTO checklists
+           (titulo, status, tipo, created_by_user_id, modelo_padrao_id)
+         VALUES ($1, 'pendente', 'personalizado', $2, $3)
+         ON CONFLICT (created_by_user_id, modelo_padrao_id)
+           WHERE modelo_padrao_id IS NOT NULL
+         DO NOTHING
+         RETURNING id`,
+        [template.rows[0].titulo, req.user!.userId, templateId.data],
+      )
+      if (!checklist.rowCount) {
+        throw new ApiError(409, "Este checklist já está na sua lista.")
+      }
+
+      await client.query(
+        `INSERT INTO checklist_items (checklist_id, titulo, posicao, descricao, regra)
+         SELECT $1, titulo, posicao, descricao, regra
+         FROM checklist_items
+         WHERE checklist_id = $2
+         ORDER BY posicao, id`,
+        [checklist.rows[0].id, templateId.data],
+      )
+
+      await client.query("COMMIT")
+      res.status(201).json({ id: String(checklist.rows[0].id) })
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
+  }),
+)
+
+app.patch(
+  "/api/checklists/:id",
+
+  asyncRoute(async (req, res) => {
+    const id = positiveId.safeParse(req.params.id)
+    if (!id.success) throw new ApiError(400, "Identificador inválido.")
+
+    const parsed = checklistSchema.safeParse(req.body)
+    if (!parsed.success) {
+      throw new ApiError(400, "Confira os dados do checklist.")
+    }
+
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+
+      const checklist = await client.query(
+        `UPDATE checklists
+         SET titulo = $1
+         WHERE id = $2 AND tipo = 'personalizado'
+           AND created_by_user_id = $3
+         RETURNING id`,
+        [parsed.data.title, id.data, req.user!.userId],
+      )
+      if (!checklist.rowCount) {
+        throw new ApiError(404, "Checklist não encontrado na sua lista.")
+      }
+
+      await client.query(
+        "DELETE FROM checklist_items WHERE checklist_id = $1",
+        [id.data],
+      )
+      for (const [position, title] of parsed.data.items.entries()) {
+        await client.query(
+          `INSERT INTO checklist_items (checklist_id, titulo, posicao)
+           VALUES ($1, $2, $3)`,
+          [id.data, title, position],
+        )
+      }
+
+      await client.query("COMMIT")
+      res.status(204).end()
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
+  }),
+)
+
+app.delete(
+  "/api/checklists/:id",
+
+  asyncRoute(async (req, res) => {
+    const id = positiveId.safeParse(req.params.id)
+    if (!id.success) throw new ApiError(400, "Identificador inválido.")
+
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+
+      const checklist = await client.query(
+        `SELECT id FROM checklists
+         WHERE id = $1 AND tipo = 'personalizado'
+           AND created_by_user_id = $2
+         FOR UPDATE`,
+        [id.data, req.user!.userId],
+      )
+      if (!checklist.rowCount) {
+        throw new ApiError(404, "Checklist não encontrado na sua lista.")
+      }
+
+      await client.query(
+        "DELETE FROM checklist_items WHERE checklist_id = $1",
+        [id.data],
+      )
+      await client.query("DELETE FROM checklists WHERE id = $1", [id.data])
+
+      await client.query("COMMIT")
+      res.status(204).end()
+    } catch (error) {
+      await client.query("ROLLBACK")
       throw error
     } finally {
       client.release()

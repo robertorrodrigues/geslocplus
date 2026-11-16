@@ -1,4 +1,10 @@
-import { useEffect, useMemo, useState, type ChangeEvent } from "react"
+import {
+  useEffect,
+  useMemo,
+  useState,
+  type ChangeEvent,
+  type FormEvent,
+} from "react"
 import { api, ApiError, initials, type AppUser } from "./api"
 import Login from "./Login"
 import PlatformAdminHome from "./PlatformAdminHome"
@@ -188,6 +194,43 @@ type Task = {
   category: string
 }
 
+type OperationTaskStatus =
+  | "iniciar"
+  | "em_andamento"
+  | "final_ok"
+  | "final_prb"
+  | "cancelada"
+
+type OperationChecklistItem = {
+  id: string
+  title: string
+  description: string | null
+  rule: string | null
+  done: boolean
+}
+
+type OperationChecklist = {
+  id: string
+  source_checklist_id: string
+  title: string
+  items: OperationChecklistItem[]
+}
+
+type OperationTask = {
+  id: string
+  name: string
+  observation: string
+  property_id: string
+  property_name: string
+  start_at: string | null
+  end_at: string | null
+  status: OperationTaskStatus
+  executor_type: "administrator" | "provider"
+  executor_id: string
+  executor_name: string
+  checklists: OperationChecklist[]
+}
+
 type Person = {
   id: string
   name: string
@@ -244,6 +287,39 @@ type TaskResponse = {
   done: boolean
 }
 
+type OperationTaskPayload = {
+  name: string
+  observation: string
+  propertyId: string
+  startAt: string | null
+  endAt: string | null
+  executorType: "administrator" | "provider"
+  executorId: string
+  checklistIds: string[]
+}
+
+type ChecklistTemplateItem = {
+  id: string
+  title: string
+  description: string | null
+  rule: string | null
+}
+
+type ChecklistTemplate = {
+  id: string
+  title: string
+  description: string | null
+  items: ChecklistTemplateItem[]
+}
+
+type PersonalChecklist = {
+  id: string
+  title: string
+  status: string
+  source_template_id: string | null
+  items: ChecklistTemplateItem[]
+}
+
 const emptyDashboard: Dashboard = {
   properties: 0,
   pendingTasks: 0,
@@ -260,6 +336,37 @@ const taskAppearance: Record<string, { icon: IconName; tone: string }> = {
   inspection: { icon: "clipboard", tone: "green" },
   maintenance: { icon: "tool", tone: "orange" },
   other: { icon: "check", tone: "green" },
+}
+
+const operationTaskStatuses: {
+  value: OperationTaskStatus
+  label: string
+}[] = [
+  { value: "iniciar", label: "Iniciar" },
+  { value: "em_andamento", label: "Em andamento" },
+  { value: "final_ok", label: "Finalizada · OK" },
+  { value: "final_prb", label: "Finalizada · com problema" },
+  { value: "cancelada", label: "Cancelada" },
+]
+
+const isTaskCompleted = (status: OperationTaskStatus) =>
+  status === "final_ok" || status === "final_prb"
+
+const isTaskPending = (status: OperationTaskStatus) =>
+  status !== "final_ok" && status !== "final_prb" && status !== "cancelada"
+
+const formatTaskSchedule = (startAt: string | null, endAt: string | null) => {
+  const format = (value: string) =>
+    new Date(value).toLocaleString("pt-BR", {
+      day: "2-digit",
+      month: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+    })
+  if (startAt && endAt) return `${format(startAt)} – ${format(endAt)}`
+  if (startAt) return `Início: ${format(startAt)}`
+  if (endAt) return `Fim: ${format(endAt)}`
+  return "Sem data definida"
 }
 
 const formatTaskTime = (value: string | null) =>
@@ -292,6 +399,11 @@ export default function App() {
   const [authMessage, setAuthMessage] = useState("")
   const [properties, setProperties] = useState<Property[]>([])
   const [tasks, setTasks] = useState<Task[]>([])
+  const [operationTasks, setOperationTasks] = useState<OperationTask[]>([])
+  const [checklists, setChecklists] = useState<PersonalChecklist[]>([])
+  const [checklistTemplates, setChecklistTemplates] = useState<
+    ChecklistTemplate[]
+  >([])
   const [people, setPeople] = useState<Person[]>([])
   const [dashboard, setDashboard] = useState(emptyDashboard)
   const [dataLoading, setDataLoading] = useState(false)
@@ -300,13 +412,15 @@ export default function App() {
     null,
   )
   const [editingProperty, setEditingProperty] = useState<Property | null>(null)
+  const [taskEditorOpen, setTaskEditorOpen] = useState(false)
+  const [editingTask, setEditingTask] = useState<OperationTask | null>(null)
   const [equipmentProperty, setEquipmentProperty] = useState<Property | null>(
     null,
   )
   const [showAdd, setShowAdd] = useState(false)
   const [notice, setNotice] = useState("")
   const [personFilter, setPersonFilter] = useState("Todos")
-  const [operationFilter, setOperationFilter] = useState("Hoje")
+  const [operationFilter, setOperationFilter] = useState("Tarefas")
 
   useEffect(() => {
     api<{ user: AppUser | null }>("/auth/me")
@@ -327,13 +441,24 @@ export default function App() {
     setDataLoading(true)
     setDataError("")
     try {
-      const [propertyResult, peopleResult, taskResult, summary] =
-        await Promise.all([
-          api<{ properties: PropertyResponse[] }>("/properties"),
-          api<{ people: PersonResponse[] }>("/people"),
-          api<{ tasks: TaskResponse[] }>("/tasks"),
-          api<Dashboard>("/dashboard"),
-        ])
+      const [
+        propertyResult,
+        peopleResult,
+        taskResult,
+        operationTaskResult,
+        checklistResult,
+        summary,
+      ] = await Promise.all([
+        api<{ properties: PropertyResponse[] }>("/properties"),
+        api<{ people: PersonResponse[] }>("/people"),
+        api<{ tasks: TaskResponse[] }>("/tasks"),
+        api<{ tasks: OperationTask[] }>("/operation/tasks"),
+        api<{
+          checklists: PersonalChecklist[]
+          templates: ChecklistTemplate[]
+        }>("/checklists"),
+        api<Dashboard>("/dashboard"),
+      ])
       setProperties(
         propertyResult.properties.map((item) => {
           return {
@@ -379,8 +504,21 @@ export default function App() {
           }
         }),
       )
-      setTasks(
-        taskResult.tasks.map((item) => ({
+      setOperationTasks(operationTaskResult.tasks)
+      setTasks([
+        ...operationTaskResult.tasks
+          .filter((item) => item.status !== "cancelada")
+          .map((item) => ({
+            id: `operation:${item.id}`,
+            icon: "clipboard" as IconName,
+            title: item.name,
+            place: item.property_name,
+            time: formatTaskSchedule(item.start_at, item.end_at),
+            tone: taskAppearance.inspection.tone,
+            done: isTaskCompleted(item.status),
+            category: "operation",
+          })),
+        ...taskResult.tasks.map((item) => ({
           id: item.id,
           icon: taskAppearance[item.category]?.icon || "check",
           title: item.title,
@@ -390,7 +528,9 @@ export default function App() {
           done: item.done,
           category: item.category,
         })),
-      )
+      ])
+      setChecklists(checklistResult.checklists)
+      setChecklistTemplates(checklistResult.templates)
       setDashboard({
         properties: Number(summary.properties),
         pendingTasks: Number(summary.pendingTasks),
@@ -410,6 +550,16 @@ export default function App() {
   }, [user])
 
   async function toggleTask(id: string) {
+    if (id.startsWith("operation:")) {
+      const task = operationTasks.find(
+        (item) => item.id === id.slice("operation:".length),
+      )
+      if (!task) return
+      const status = isTaskCompleted(task.status) ? "iniciar" : "final_ok"
+      await updateOperationTaskStatus(task.id, status)
+      return
+    }
+
     const task = tasks.find((item) => item.id === id)
     if (!task) return
     try {
@@ -422,14 +572,6 @@ export default function App() {
           item.id === id ? { ...item, done: !item.done } : item,
         ),
       )
-      setDashboard((current) => ({
-        ...current,
-        completedTasks: Math.max(
-          0,
-          current.completedTasks + (task.done ? -1 : 1),
-        ),
-        pendingTasks: Math.max(0, current.pendingTasks + (task.done ? 1 : -1)),
-      }))
     } catch (error) {
       flash(
         error instanceof Error
@@ -437,6 +579,114 @@ export default function App() {
           : "Não foi possível atualizar a tarefa.",
       )
     }
+  }
+
+  async function updateOperationTaskStatus(
+    id: string,
+    status: OperationTaskStatus,
+  ) {
+    const task = operationTasks.find((item) => item.id === id)
+    if (!task || task.status === status) return
+
+    try {
+      await api(`/operation/tasks/${encodeURIComponent(id)}/status`, {
+        method: "PATCH",
+        body: JSON.stringify({ status }),
+      })
+      setOperationTasks((current) =>
+        current.map((item) => (item.id === id ? { ...item, status } : item)),
+      )
+      setTasks((current) => {
+        const remaining = current.filter(
+          (item) => item.id !== `operation:${id}`,
+        )
+        return status === "cancelada"
+          ? remaining
+          : [
+              {
+                id: `operation:${id}`,
+                icon: "clipboard",
+                title: task.name,
+                place: task.property_name,
+                time: formatTaskSchedule(task.start_at, task.end_at),
+                tone: taskAppearance.inspection.tone,
+                done: isTaskCompleted(status),
+                category: "operation",
+              },
+              ...remaining,
+            ]
+      })
+      setDashboard((current) => ({
+        ...current,
+        pendingTasks: Math.max(
+          0,
+          current.pendingTasks -
+            Number(isTaskPending(task.status)) +
+            Number(isTaskPending(status)),
+        ),
+        completedTasks: Math.max(
+          0,
+          current.completedTasks -
+            Number(isTaskCompleted(task.status)) +
+            Number(isTaskCompleted(status)),
+        ),
+      }))
+    } catch (error) {
+      flash(
+        error instanceof Error
+          ? error.message
+          : "Não foi possível atualizar o status da tarefa.",
+      )
+    }
+  }
+
+  async function saveOperationTask(data: OperationTaskPayload) {
+    const id = editingTask?.id
+    await api(`/operation/tasks${id ? `/${encodeURIComponent(id)}` : ""}`, {
+      method: id ? "PATCH" : "POST",
+      body: JSON.stringify(data),
+    })
+    setTaskEditorOpen(false)
+    setEditingTask(null)
+    flash(id ? "Tarefa atualizada." : "Tarefa criada.")
+    await loadAppData()
+  }
+
+  async function deleteOperationTask(id: string) {
+    await api(`/operation/tasks/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    })
+    flash("Tarefa excluída.")
+    await loadAppData()
+  }
+
+  async function toggleOperationChecklistItem(
+    taskId: string,
+    itemId: string,
+    completed: boolean,
+  ) {
+    await api(
+      `/operation/tasks/${encodeURIComponent(taskId)}/checklist-items/${encodeURIComponent(itemId)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ completed }),
+      },
+    )
+    setOperationTasks((current) =>
+      current.map((task) =>
+        task.id !== taskId
+          ? task
+          : {
+              ...task,
+              checklists: task.checklists.map((checklist) => ({
+                ...checklist,
+                items: checklist.items.map((item) =>
+                  item.id === itemId ? { ...item, done: completed } : item,
+                ),
+              })),
+            },
+      ),
+    )
   }
 
   async function saveRecord(data: Record<string, unknown>, recordId?: string) {
@@ -460,6 +710,32 @@ export default function App() {
     await loadAppData()
   }
 
+  async function addChecklistTemplate(templateId: string) {
+    await api(`/checklists/${encodeURIComponent(templateId)}/subscribe`, {
+      method: "POST",
+    })
+    flash("Checklist adicionado à sua lista.")
+    await loadAppData()
+  }
+
+  async function updateChecklist(
+    id: string,
+    data: { title: string; items: string[] },
+  ) {
+    await api(`/checklists/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(data),
+    })
+    flash("Checklist atualizado.")
+    await loadAppData()
+  }
+
+  async function deleteChecklist(id: string) {
+    await api(`/checklists/${encodeURIComponent(id)}`, { method: "DELETE" })
+    flash("Checklist removido da sua lista.")
+    await loadAppData()
+  }
+
   async function logout() {
     try {
       await api("/auth/logout", { method: "POST" })
@@ -467,7 +743,12 @@ export default function App() {
       setProperties([])
       setPeople([])
       setTasks([])
+      setOperationTasks([])
+      setChecklists([])
+      setChecklistTemplates([])
       setDashboard(emptyDashboard)
+      setTaskEditorOpen(false)
+      setEditingTask(null)
     } catch (error) {
       flash(error instanceof Error ? error.message : "Não foi possível sair.")
     }
@@ -575,11 +856,32 @@ export default function App() {
           )}
           {tab === "operation" && (
             <OperationScreen
-              tasks={tasks}
+              tasks={operationTasks}
+              checklistTasks={tasks.filter((task) =>
+                task.id.startsWith("checklist:"),
+              )}
+              checklists={checklists}
+              templates={checklistTemplates}
               filter={operationFilter}
               setFilter={setOperationFilter}
               onToggleTask={toggleTask}
-              onAdd={() => setShowAdd(true)}
+              onAddChecklist={() => setShowAdd(true)}
+              onAddTask={() => {
+                setEditingTask(null)
+                setTaskEditorOpen(true)
+              }}
+              onEditTask={(task) => {
+                setEditingTask(task)
+                setTaskEditorOpen(true)
+              }}
+              onTaskStatus={(id, status) =>
+                void updateOperationTaskStatus(id, status)
+              }
+              onToggleChecklistItem={toggleOperationChecklistItem}
+              onDeleteTask={deleteOperationTask}
+              onAddTemplate={addChecklistTemplate}
+              onUpdateChecklist={updateChecklist}
+              onDeleteChecklist={deleteChecklist}
             />
           )}
           {tab === "people" && (
@@ -615,6 +917,20 @@ export default function App() {
               setEditingProperty(null)
             }}
             onSave={saveRecord}
+          />
+        )}
+        {taskEditorOpen && (
+          <TaskEditorSheet
+            task={editingTask}
+            properties={properties}
+            people={people}
+            checklists={checklists}
+            templates={checklistTemplates}
+            onClose={() => {
+              setTaskEditorOpen(false)
+              setEditingTask(null)
+            }}
+            onSave={saveOperationTask}
           />
         )}
         {equipmentProperty && (
@@ -1039,25 +1355,69 @@ function MiniStat({ value, label }: { value: string; label: string }) {
 
 function OperationScreen({
   tasks,
+  checklistTasks,
+  checklists,
+  templates,
   filter,
   setFilter,
   onToggleTask,
-  onAdd,
+  onAddChecklist,
+  onAddTask,
+  onEditTask,
+  onTaskStatus,
+  onToggleChecklistItem,
+  onDeleteTask,
+  onAddTemplate,
+  onUpdateChecklist,
+  onDeleteChecklist,
 }: {
-  tasks: Task[]
+  tasks: OperationTask[]
+  checklistTasks: Task[]
+  checklists: PersonalChecklist[]
+  templates: ChecklistTemplate[]
   filter: string
   setFilter: (value: string) => void
   onToggleTask: (id: string) => void
-  onAdd: () => void
+  onAddChecklist: () => void
+  onAddTask: () => void
+  onEditTask: (task: OperationTask) => void
+  onTaskStatus: (id: string, status: OperationTaskStatus) => void
+  onToggleChecklistItem: (
+    taskId: string,
+    itemId: string,
+    completed: boolean,
+  ) => Promise<void>
+  onDeleteTask: (id: string) => Promise<void>
+  onAddTemplate: (id: string) => Promise<void>
+  onUpdateChecklist: (
+    id: string,
+    data: { title: string; items: string[] },
+  ) => Promise<void>
+  onDeleteChecklist: (id: string) => Promise<void>
 }) {
-  const visibleTasks =
-    filter === "Checklists"
-      ? tasks.filter((task) => task.category === "inspection")
-      : tasks
+  const [addingTemplateId, setAddingTemplateId] = useState("")
+  const [actionError, setActionError] = useState("")
+
+  async function addTemplate(templateId: string) {
+    setAddingTemplateId(templateId)
+    setActionError("")
+    try {
+      await onAddTemplate(templateId)
+    } catch (reason) {
+      setActionError(
+        reason instanceof Error
+          ? reason.message
+          : "Não foi possível adicionar o checklist.",
+      )
+    } finally {
+      setAddingTemplateId("")
+    }
+  }
+
   return (
     <section className="px-5">
       <div className="mb-6 flex rounded-2xl bg-[#ebeae4] p-1">
-        {["Hoje", "Checklists"].map((item) => (
+        {["Tarefas", "Checklists"].map((item) => (
           <button
             key={item}
             onClick={() => setFilter(item)}
@@ -1075,39 +1435,116 @@ function OperationScreen({
         <div className="mb-4 flex items-end justify-between">
           <div>
             <p className="text-xs font-bold text-[#8d9591]">
-              {new Date().toLocaleDateString("pt-BR", {
-                weekday: "long",
-                day: "numeric",
-                month: "long",
-              })}
+              {filter === "Tarefas"
+                ? "Imóveis, executores e checklists em um só lugar"
+                : "Modelos padrão e sua lista pessoal"}
             </p>
             <h2 className="mt-1 text-xl font-extrabold">
-              {filter === "Hoje"
-                ? `${visibleTasks.filter((task) => !task.done).length} ações programadas`
-                : "Checklists ativos"}
+              {filter === "Tarefas"
+                ? `${tasks.filter((task) => isTaskPending(task.status)).length} tarefas pendentes`
+                : `${checklists.length} checklists na sua lista`}
             </h2>
           </div>
           <button
-            onClick={onAdd}
+            onClick={filter === "Tarefas" ? onAddTask : onAddChecklist}
+            aria-label={
+              filter === "Tarefas" ? "Criar tarefa" : "Criar checklist"
+            }
             className="flex h-10 w-10 items-center justify-center rounded-full bg-[#ed765f] text-white shadow-lg"
           >
             <Icon name="plus" />
           </button>
         </div>
-        <div className="relative space-y-3 before:absolute before:bottom-10 before:left-[21px] before:top-10 before:w-px before:bg-[#dcded8]">
-          {visibleTasks.map((task) => (
-            <TaskRow
-              key={task.id}
-              task={task}
-              onToggle={() => onToggleTask(task.id)}
-            />
-          ))}
-          {!visibleTasks.length && (
-            <p className="rounded-2xl border border-[#ebe9e1] bg-white p-4 text-xs font-semibold text-[#89918d]">
-              Nenhuma ação para exibir.
-            </p>
-          )}
-        </div>
+        {filter === "Tarefas" ? (
+          <div className="space-y-3">
+            {tasks.map((task) => (
+              <OperationTaskCard
+                key={task.id}
+                task={task}
+                onEdit={() => onEditTask(task)}
+                onStatus={onTaskStatus}
+                onToggleItem={onToggleChecklistItem}
+                onDelete={onDeleteTask}
+              />
+            ))}
+            {!tasks.length && (
+              <p className="rounded-2xl border border-[#ebe9e1] bg-white p-4 text-xs font-semibold text-[#89918d]">
+                Nenhuma tarefa cadastrada. Crie uma tarefa para vinculá-la a um
+                imóvel.
+              </p>
+            )}
+          </div>
+        ) : (
+          <div className="space-y-7">
+            {actionError && (
+              <p
+                role="alert"
+                className="rounded-2xl border border-[#f1c8bd] bg-[#fff1ec] px-4 py-3 text-xs font-bold text-[#a84734]"
+              >
+                {actionError}
+              </p>
+            )}
+            <section>
+              <div className="mb-3">
+                <h3 className="text-sm font-extrabold">Modelos padrão</h3>
+                <p className="mt-1 text-[10px] font-semibold text-[#89938d]">
+                  Adicione uma cópia à sua lista para personalizá-la.
+                </p>
+              </div>
+              <div className="space-y-3">
+                {templates.map((template) => {
+                  const alreadyAdded = checklists.some(
+                    (checklist) =>
+                      checklist.source_template_id === template.id,
+                  )
+                  return (
+                    <ChecklistTemplateCard
+                      key={template.id}
+                      checklist={template}
+                      alreadyAdded={alreadyAdded}
+                      adding={addingTemplateId === template.id}
+                      onAdd={() => void addTemplate(template.id)}
+                    />
+                  )
+                })}
+                {!templates.length && (
+                  <p className="rounded-2xl border border-[#ebe9e1] bg-white p-4 text-xs font-semibold text-[#89918d]">
+                    Nenhum modelo padrão disponível.
+                  </p>
+                )}
+              </div>
+            </section>
+
+            <section>
+              <div className="mb-3">
+                <h3 className="text-sm font-extrabold">Minha lista</h3>
+                <p className="mt-1 text-[10px] font-semibold text-[#89938d]">
+                  Altere nome e itens sem modificar o modelo compartilhado.
+                </p>
+              </div>
+              <div className="space-y-3">
+                {checklists.map((checklist) => (
+                  <PersonalChecklistCard
+                    key={checklist.id}
+                    checklist={checklist}
+                    task={checklistTasks.find(
+                      (task) => task.id === `checklist:${checklist.id}`,
+                    )}
+                    onToggleTask={onToggleTask}
+                    onUpdate={onUpdateChecklist}
+                    onDelete={onDeleteChecklist}
+                  />
+                ))}
+                {!checklists.length && (
+                  <p className="rounded-2xl border border-[#ebe9e1] bg-white p-4 text-xs font-semibold text-[#89918d]">
+                    Sua lista está vazia. Adicione um modelo padrão ou crie um
+                    checklist.
+                  </p>
+                )}
+              </div>
+            </section>
+          </div>
+        )}
         <div className="mt-7 rounded-[24px] bg-[#173e37] p-5 text-white">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
@@ -1126,6 +1563,764 @@ function OperationScreen({
         </div>
       </>
     </section>
+  )
+}
+
+function OperationTaskCard({
+  task,
+  onEdit,
+  onStatus,
+  onToggleItem,
+  onDelete,
+}: {
+  task: OperationTask
+  onEdit: () => void
+  onStatus: (id: string, status: OperationTaskStatus) => void
+  onToggleItem: (
+    taskId: string,
+    itemId: string,
+    completed: boolean,
+  ) => Promise<void>
+  onDelete: (id: string) => Promise<void>
+}) {
+  const [error, setError] = useState("")
+
+  async function toggleItem(itemId: string, completed: boolean) {
+    setError("")
+    try {
+      await onToggleItem(task.id, itemId, completed)
+    } catch (reason) {
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : "Não foi possível atualizar o item.",
+      )
+    }
+  }
+
+  async function remove() {
+    if (!window.confirm(`Excluir a tarefa "${task.name}"?`)) return
+    setError("")
+    try {
+      await onDelete(task.id)
+    } catch (reason) {
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : "Não foi possível excluir a tarefa.",
+      )
+    }
+  }
+
+  const statusLabel =
+    operationTaskStatuses.find((status) => status.value === task.status)?.label ??
+    task.status
+  const checklistItemCount = task.checklists.reduce(
+    (total, checklist) => total + checklist.items.length,
+    0,
+  )
+
+  return (
+    <article className="rounded-[22px] border border-[#e4e6df] bg-white p-4 shadow-[0_6px_18px_rgba(25,39,35,.04)]">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="break-words text-sm font-extrabold text-[#20352f]">
+            {task.name}
+          </h3>
+          <p className="mt-1 text-[11px] font-semibold text-[#64706a]">
+            {task.property_name}
+          </p>
+        </div>
+        <div className="flex shrink-0 gap-2">
+          <button
+            type="button"
+            onClick={onEdit}
+            className="rounded-full border border-[#dfe2db] px-3 py-1.5 text-[10px] font-extrabold text-[#34705d]"
+          >
+            Editar
+          </button>
+          <button
+            type="button"
+            onClick={() => void remove()}
+            className="rounded-full border border-[#f0d7d0] px-3 py-1.5 text-[10px] font-extrabold text-[#a84734]"
+          >
+            Excluir
+          </button>
+        </div>
+      </div>
+      <div className="mt-3 space-y-1 text-[10px] font-semibold text-[#89938d]">
+        <p>{formatTaskSchedule(task.start_at, task.end_at)}</p>
+        <p>
+          Executor: {task.executor_name} ·{" "}
+          {task.executor_type === "administrator"
+            ? "Administrador"
+            : "Prestador de serviços"}
+        </p>
+      </div>
+      {task.observation && (
+        <p className="mt-3 whitespace-pre-wrap text-xs leading-5 text-[#596761]">
+          {task.observation}
+        </p>
+      )}
+      <label className="mt-4 block">
+        <span className="field-label">Status · {statusLabel}</span>
+        <select
+          value={task.status}
+          onChange={(event) => {
+            const nextStatus = operationTaskStatuses.find(
+              (status) => status.value === event.currentTarget.value,
+            )?.value
+            if (nextStatus) onStatus(task.id, nextStatus)
+          }}
+          className="w-full rounded-2xl border border-[#dfded7] bg-white px-4 py-3 text-xs font-bold outline-none focus:border-[#34705d]"
+        >
+          {operationTaskStatuses.map((status) => (
+            <option key={status.value} value={status.value}>
+              {status.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      <details className="mt-3 rounded-2xl bg-[#f7f8f4] p-3">
+        <summary className="cursor-pointer text-xs font-extrabold text-[#34705d]">
+          Checklists ({task.checklists.length}) · {checklistItemCount} itens
+        </summary>
+        <div className="mt-3 space-y-4">
+          {task.checklists.map((checklist) => (
+            <div key={checklist.id}>
+              <h4 className="mb-2 text-xs font-extrabold text-[#42504a]">
+                {checklist.title}
+              </h4>
+              <ul className="space-y-2">
+                {checklist.items.map((item) => (
+                  <li key={item.id}>
+                    <label className="flex items-start gap-2 text-xs font-semibold text-[#596761]">
+                      <input
+                        type="checkbox"
+                        checked={item.done}
+                        onChange={(event) =>
+                          void toggleItem(item.id, event.currentTarget.checked)
+                        }
+                        className="mt-0.5 accent-[#34705d]"
+                      />
+                      <span className={item.done ? "line-through opacity-60" : ""}>
+                        {item.title}
+                      </span>
+                    </label>
+                    {item.description && (
+                      <p className="ml-6 mt-1 text-[10px] text-[#89938d]">
+                        {item.description}
+                      </p>
+                    )}
+                  </li>
+                ))}
+                {!checklist.items.length && (
+                  <li className="text-[10px] font-semibold text-[#89938d]">
+                    Nenhum item neste checklist.
+                  </li>
+                )}
+              </ul>
+            </div>
+          ))}
+          {!task.checklists.length && (
+            <p className="text-[10px] font-semibold text-[#89938d]">
+              Nenhum checklist associado.
+            </p>
+          )}
+        </div>
+      </details>
+      {error && (
+        <p role="alert" className="mt-3 text-[11px] font-bold text-[#a84734]">
+          {error}
+        </p>
+      )}
+    </article>
+  )
+}
+
+function toLocalDateTimeInput(value: string | null | undefined) {
+  if (!value) return ""
+  const date = new Date(value)
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60_000)
+    .toISOString()
+    .slice(0, 16)
+}
+
+function fromLocalDateTimeInput(value: string) {
+  return value ? new Date(value).toISOString() : null
+}
+
+function TaskEditorSheet({
+  task,
+  properties,
+  people,
+  checklists,
+  templates,
+  onClose,
+  onSave,
+}: {
+  task: OperationTask | null
+  properties: Property[]
+  people: Person[]
+  checklists: PersonalChecklist[]
+  templates: ChecklistTemplate[]
+  onClose: () => void
+  onSave: (data: OperationTaskPayload) => Promise<void>
+}) {
+  const [name, setName] = useState("")
+  const [observation, setObservation] = useState("")
+  const [propertyId, setPropertyId] = useState("")
+  const [startAt, setStartAt] = useState("")
+  const [endAt, setEndAt] = useState("")
+  const [executorValue, setExecutorValue] = useState("")
+  const [checklistIds, setChecklistIds] = useState<string[]>([])
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState("")
+
+  const checklistOptions = useMemo(() => {
+    const options = [
+      ...templates.map((checklist) => ({
+        id: checklist.id,
+        title: checklist.title,
+      })),
+      ...checklists.map((checklist) => ({
+        id: checklist.id,
+        title: checklist.title,
+      })),
+    ]
+    for (const attached of task?.checklists || []) {
+      if (!options.some((option) => option.id === attached.source_checklist_id)) {
+        options.push({
+          id: attached.source_checklist_id,
+          title: `${attached.title} (cópia desta tarefa)`,
+        })
+      }
+    }
+    return options
+  }, [checklists, task, templates])
+
+  const executors = people.filter(
+    (person) =>
+      person.kind === "administrator" || person.kind === "provider",
+  )
+
+  useEffect(() => {
+    setName(task?.name || "")
+    setObservation(task?.observation || "")
+    setPropertyId(task?.property_id || "")
+    setStartAt(toLocalDateTimeInput(task?.start_at))
+    setEndAt(toLocalDateTimeInput(task?.end_at))
+    setExecutorValue(
+      task ? `${task.executor_type}:${task.executor_id}` : "",
+    )
+    setChecklistIds(
+      task?.checklists.map((checklist) => checklist.source_checklist_id) || [],
+    )
+    setError("")
+  }, [task])
+
+  function toggleChecklist(checklistId: string) {
+    setChecklistIds((current) =>
+      current.includes(checklistId)
+        ? current.filter((id) => id !== checklistId)
+        : [...current, checklistId],
+    )
+  }
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setError("")
+    const cleanedName = name.trim()
+    const [executorType, executorId] = executorValue.split(":")
+
+    if (cleanedName.length < 2) {
+      setError("Informe um nome com pelo menos 2 caracteres.")
+      return
+    }
+    if (!propertyId) {
+      setError("Selecione o imóvel obrigatório da tarefa.")
+      return
+    }
+    if (
+      !executorId ||
+      (executorType !== "administrator" && executorType !== "provider")
+    ) {
+      setError("Selecione um administrador ou prestador de serviços.")
+      return
+    }
+    if (
+      startAt &&
+      endAt &&
+      new Date(startAt).getTime() > new Date(endAt).getTime()
+    ) {
+      setError("A data de início deve ser anterior à data de fim.")
+      return
+    }
+
+    setSaving(true)
+    try {
+      await onSave({
+        name: cleanedName,
+        observation: observation.trim(),
+        propertyId,
+        startAt: fromLocalDateTimeInput(startAt),
+        endAt: fromLocalDateTimeInput(endAt),
+        executorType,
+        executorId,
+        checklistIds,
+      })
+    } catch (reason) {
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : "Não foi possível salvar a tarefa.",
+      )
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-[90] flex items-end justify-center bg-[#172321]/40">
+      <section className="flex max-h-[95dvh] w-full max-w-[460px] flex-col overflow-hidden rounded-t-[28px] bg-[#f8f7f2] shadow-2xl">
+        <header className="flex items-center justify-between border-b border-[#e5e3dc] px-5 py-4">
+          <div>
+            <p className="text-[10px] font-bold uppercase tracking-[.16em] text-[#89918d]">
+              Operação
+            </p>
+            <h2 className="text-xl font-extrabold">
+              {task ? "Editar tarefa" : "Nova tarefa"}
+            </h2>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="icon-button"
+            aria-label="Fechar formulário"
+          >
+            <Icon name="close" size={18} />
+          </button>
+        </header>
+        <form onSubmit={submit} className="flex min-h-0 flex-1 flex-col">
+          <div className="flex-1 space-y-4 overflow-y-auto px-5 py-5">
+            {error && (
+              <p
+                role="alert"
+                className="rounded-2xl border border-[#f1c8bd] bg-[#fff1ec] p-3 text-xs font-bold text-[#a84734]"
+              >
+                {error}
+              </p>
+            )}
+            <Field
+              label="Nome da tarefa"
+              placeholder="Ex.: Preparar imóvel para o check-in"
+              value={name}
+              onChange={setName}
+              required
+              maxLength={160}
+            />
+            <label className="block">
+              <span className="field-label">Imóvel · obrigatório</span>
+              <select
+                value={propertyId}
+                onChange={(event) => setPropertyId(event.target.value)}
+                required
+                className="w-full rounded-2xl border border-[#dfded7] bg-white px-4 py-3.5 text-sm font-semibold outline-none focus:border-[#34705d]"
+              >
+                <option value="">Selecione um imóvel</option>
+                {properties.map((property) => (
+                  <option key={property.id} value={property.id}>
+                    {property.name}
+                  </option>
+                ))}
+              </select>
+              {!properties.length && (
+                <span className="mt-1 block text-[10px] font-semibold text-[#a84734]">
+                  Cadastre ou vincule um imóvel antes de criar a tarefa.
+                </span>
+              )}
+            </label>
+            <label className="block">
+              <span className="field-label">Executor · obrigatório</span>
+              <select
+                value={executorValue}
+                onChange={(event) => setExecutorValue(event.target.value)}
+                required
+                className="w-full rounded-2xl border border-[#dfded7] bg-white px-4 py-3.5 text-sm font-semibold outline-none focus:border-[#34705d]"
+              >
+                <option value="">Selecione um executor</option>
+                {executors.map((person) => {
+                  const personId = person.id.split(":").pop() || ""
+                  const executorKey = `${person.kind}:${personId}`
+                  return (
+                    <option key={executorKey} value={executorKey}>
+                      {person.name} ·{" "}
+                      {person.kind === "administrator"
+                        ? "Administrador"
+                        : "Prestador de serviços"}
+                    </option>
+                  )
+                })}
+              </select>
+              {!executors.length && (
+                <span className="mt-1 block text-[10px] font-semibold text-[#a84734]">
+                  Cadastre um administrador ou prestador antes de criar a tarefa.
+                </span>
+              )}
+            </label>
+            <div className="grid grid-cols-1 gap-3">
+              <label className="block">
+                <span className="field-label">Data e hora de início</span>
+                <input
+                  type="datetime-local"
+                  value={startAt}
+                  max={endAt || undefined}
+                  onChange={(event) => setStartAt(event.target.value)}
+                  className="w-full rounded-2xl border border-[#dfded7] bg-white px-4 py-3 text-xs font-semibold outline-none focus:border-[#34705d]"
+                />
+              </label>
+              <label className="block">
+                <span className="field-label">Data e hora de fim</span>
+                <input
+                  type="datetime-local"
+                  value={endAt}
+                  min={startAt || undefined}
+                  onChange={(event) => setEndAt(event.target.value)}
+                  className="w-full rounded-2xl border border-[#dfded7] bg-white px-4 py-3 text-xs font-semibold outline-none focus:border-[#34705d]"
+                />
+              </label>
+            </div>
+            <label className="block">
+              <span className="field-label">Observação</span>
+              <textarea
+                value={observation}
+                onChange={(event) => setObservation(event.target.value)}
+                rows={3}
+                maxLength={2000}
+                className="w-full rounded-2xl border border-[#dfded7] bg-white px-4 py-3.5 text-sm font-semibold outline-none focus:border-[#34705d]"
+                placeholder="Detalhes importantes para a execução"
+              />
+            </label>
+            <fieldset className="rounded-2xl border border-[#e4e6df] bg-white p-4">
+              <legend className="px-1 text-xs font-extrabold text-[#20352f]">
+                Checklists da tarefa
+              </legend>
+              <p className="mb-3 text-[10px] font-semibold text-[#89938d]">
+                Cada seleção será copiada para esta tarefa com progresso
+                independente.
+              </p>
+              <div className="space-y-2">
+                {checklistOptions.map((checklist) => (
+                  <label
+                    key={checklist.id}
+                    className="flex items-start gap-2 text-xs font-semibold text-[#596761]"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checklistIds.includes(checklist.id)}
+                      onChange={() => toggleChecklist(checklist.id)}
+                      className="mt-0.5 accent-[#34705d]"
+                    />
+                    <span>{checklist.title}</span>
+                  </label>
+                ))}
+                {!checklistOptions.length && (
+                  <p className="text-[10px] font-semibold text-[#89938d]">
+                    Nenhum checklist disponível. Você pode salvar a tarefa sem
+                    checklists.
+                  </p>
+                )}
+              </div>
+            </fieldset>
+          </div>
+          <footer className="border-t border-[#e5e3dc] bg-[#f8f7f2] px-5 py-4">
+            <button
+              type="submit"
+              disabled={
+                saving || !properties.length || !executors.length
+              }
+              className="primary-button disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {saving ? "Salvando..." : task ? "Salvar alterações" : "Criar tarefa"}
+              <Icon name="arrow" size={18} />
+            </button>
+          </footer>
+        </form>
+      </section>
+    </div>
+  )
+}
+
+function ChecklistTemplateCard({
+  checklist,
+  alreadyAdded,
+  adding,
+  onAdd,
+}: {
+  checklist: ChecklistTemplate
+  alreadyAdded: boolean
+  adding: boolean
+  onAdd: () => void
+}) {
+  return (
+    <article className="rounded-[22px] border border-[#dce6df] bg-white p-4 shadow-[0_6px_18px_rgba(25,39,35,.04)]">
+      <div className="flex items-start justify-between gap-3">
+        <h3 className="text-sm font-extrabold text-[#20352f]">
+          {checklist.title}
+        </h3>
+        <span className="shrink-0 rounded-full bg-[#edf4ef] px-2.5 py-1 text-[9px] font-extrabold uppercase tracking-[.12em] text-[#34705d]">
+          Padrão
+        </span>
+      </div>
+      {checklist.description && (
+        <p className="mt-2 text-xs leading-5 text-[#77837d]">
+          {checklist.description}
+        </p>
+      )}
+      <ol className="mt-4 space-y-2 border-t border-[#eef0ea] pt-3">
+        {checklist.items.map((item, index) => (
+          <li key={item.id} className="flex items-start gap-2.5">
+            <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[#f0f3ee] text-[9px] font-extrabold text-[#61766d]">
+              {index + 1}
+            </span>
+            <div className="min-w-0">
+              <p className="text-xs font-bold text-[#42504a]">{item.title}</p>
+              {item.description && (
+                <p className="mt-1 text-[10px] leading-4 text-[#89938d]">
+                  {item.description}
+                </p>
+              )}
+            </div>
+          </li>
+        ))}
+      </ol>
+      <button
+        type="button"
+        onClick={onAdd}
+        disabled={alreadyAdded || adding}
+        className="mt-4 w-full rounded-full border border-[#d7e3da] bg-[#f2f7f3] px-4 py-2.5 text-xs font-extrabold text-[#34705d] transition hover:bg-[#e8f1eb] disabled:cursor-default disabled:opacity-70"
+      >
+        {adding
+          ? "Adicionando..."
+          : alreadyAdded
+            ? "Já está na minha lista"
+            : "Adicionar à minha lista"}
+      </button>
+    </article>
+  )
+}
+
+function PersonalChecklistCard({
+  checklist,
+  task,
+  onToggleTask,
+  onUpdate,
+  onDelete,
+}: {
+  checklist: PersonalChecklist
+  task?: Task
+  onToggleTask: (id: string) => void
+  onUpdate: (
+    id: string,
+    data: { title: string; items: string[] },
+  ) => Promise<void>
+  onDelete: (id: string) => Promise<void>
+}) {
+  const [editing, setEditing] = useState(false)
+  const [title, setTitle] = useState(checklist.title)
+  const [itemsText, setItemsText] = useState(
+    checklist.items.map((item) => item.title).join("\n"),
+  )
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState("")
+
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setError("")
+
+    const cleanedTitle = title.trim()
+    const items = itemsText
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+
+    if (cleanedTitle.length < 2) {
+      setError("O nome deve ter pelo menos 2 caracteres.")
+      return
+    }
+    if (items.length > 50) {
+      setError("Cada checklist pode ter no máximo 50 itens.")
+      return
+    }
+    if (items.some((item) => item.length > 160)) {
+      setError("Cada item pode ter no máximo 160 caracteres.")
+      return
+    }
+
+    setSaving(true)
+    try {
+      await onUpdate(checklist.id, { title: cleanedTitle, items })
+      setEditing(false)
+    } catch (reason) {
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : "Não foi possível salvar o checklist.",
+      )
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function remove() {
+    if (!window.confirm(`Remover "${checklist.title}" da sua lista?`)) return
+    setSaving(true)
+    setError("")
+    try {
+      await onDelete(checklist.id)
+    } catch (reason) {
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : "Não foi possível remover o checklist.",
+      )
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <article className="rounded-[22px] border border-[#e4e6df] bg-white p-4 shadow-[0_6px_18px_rgba(25,39,35,.04)]">
+      {editing ? (
+        <form onSubmit={save} className="space-y-3">
+          <Field
+            label="Nome do checklist"
+            value={title}
+            onChange={setTitle}
+            required
+            maxLength={160}
+          />
+          <label className="block">
+            <span className="field-label">Itens, um por linha</span>
+            <textarea
+              value={itemsText}
+              onChange={(event) => setItemsText(event.target.value)}
+              rows={5}
+              className="w-full rounded-2xl border border-[#dfded7] bg-white px-4 py-3 text-sm font-semibold outline-none focus:border-[#34705d]"
+              placeholder="Digite os itens do checklist"
+            />
+          </label>
+          {error && (
+            <p
+              role="alert"
+              className="rounded-xl border border-[#f1c8bd] bg-[#fff1ec] px-3 py-2 text-[11px] font-bold text-[#a84734]"
+            >
+              {error}
+            </p>
+          )}
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                setTitle(checklist.title)
+                setItemsText(checklist.items.map((item) => item.title).join("\n"))
+                setEditing(false)
+                setError("")
+              }}
+              disabled={saving}
+              className="flex-1 rounded-full border border-[#dfe2db] px-3 py-2.5 text-xs font-extrabold text-[#59645f] disabled:opacity-60"
+            >
+              Cancelar
+            </button>
+            <button
+              type="submit"
+              disabled={saving}
+              className="flex-1 rounded-full bg-[#173e37] px-3 py-2.5 text-xs font-extrabold text-white disabled:opacity-60"
+            >
+              {saving ? "Salvando..." : "Salvar"}
+            </button>
+          </div>
+        </form>
+      ) : (
+        <>
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <h4 className="break-words text-sm font-extrabold text-[#20352f]">
+                {checklist.title}
+              </h4>
+              <p className="mt-1 text-[9px] font-extrabold uppercase tracking-[.12em] text-[#89938d]">
+                {checklist.source_template_id
+                  ? "Cópia personalizada do padrão"
+                  : "Checklist pessoal"}
+              </p>
+            </div>
+            <div className="flex shrink-0 gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setTitle(checklist.title)
+                  setItemsText(
+                    checklist.items.map((item) => item.title).join("\n"),
+                  )
+                  setEditing(true)
+                  setError("")
+                }}
+                disabled={saving}
+                className="rounded-full border border-[#dfe2db] px-3 py-1.5 text-[10px] font-extrabold text-[#34705d] disabled:opacity-60"
+              >
+                Editar
+              </button>
+              <button
+                type="button"
+                onClick={() => void remove()}
+                disabled={saving}
+                className="rounded-full border border-[#f0d7d0] px-3 py-1.5 text-[10px] font-extrabold text-[#a84734] disabled:opacity-60"
+              >
+                Remover
+              </button>
+            </div>
+          </div>
+          <ol className="mt-3 space-y-2 border-t border-[#eef0ea] pt-3">
+            {checklist.items.map((item, index) => (
+              <li key={item.id} className="flex items-start gap-2.5">
+                <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[#f0f3ee] text-[9px] font-extrabold text-[#61766d]">
+                  {index + 1}
+                </span>
+                <p className="text-xs font-semibold text-[#596761]">
+                  {item.title}
+                </p>
+              </li>
+            ))}
+            {!checklist.items.length && (
+              <li className="text-xs font-semibold text-[#89938d]">
+                Nenhum item cadastrado.
+              </li>
+            )}
+          </ol>
+          {task && (
+            <button
+              type="button"
+              onClick={() => onToggleTask(task.id)}
+              className={`mt-4 rounded-full px-3 py-2 text-[10px] font-extrabold ${
+                task.done
+                  ? "bg-[#e4f1e9] text-[#34705d]"
+                  : "bg-[#f5eee7] text-[#a75e42]"
+              }`}
+            >
+              {task.done ? "Concluído · marcar pendente" : "Marcar concluído"}
+            </button>
+          )}
+        </>
+      )}
+      {!editing && error && (
+        <p
+          role="alert"
+          className="mt-3 rounded-xl border border-[#f1c8bd] bg-[#fff1ec] px-3 py-2 text-[11px] font-bold text-[#a84734]"
+        >
+          {error}
+        </p>
+      )}
+    </article>
   )
 }
 
@@ -2141,6 +3336,7 @@ function Field({
   value,
   onChange,
   required = false,
+  maxLength,
 }: {
   label: string
   placeholder?: string
@@ -2148,6 +3344,7 @@ function Field({
   value: string
   onChange: (value: string) => void
   required?: boolean
+  maxLength?: number
 }) {
   return (
     <label className="block">
@@ -2155,6 +3352,7 @@ function Field({
       <input
         type={type}
         required={required}
+        maxLength={maxLength}
         value={value}
         onChange={(event) => onChange(event.target.value)}
         className="w-full rounded-2xl border border-[#dfded7] bg-white px-4 py-3.5 text-sm font-semibold outline-none transition placeholder:text-[#a8adaa] focus:border-[#34705d] focus:ring-2 focus:ring-[#34705d]/10"
