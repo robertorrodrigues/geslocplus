@@ -2,6 +2,7 @@ export type AppUser = {
   id: string
   fullName: string
   email: string
+  role: "administrator" | "platform_admin"
 }
 
 export class ApiError extends Error {

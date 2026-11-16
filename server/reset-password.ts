@@ -115,7 +115,7 @@ try {
 
       tipo_pessoa: string | null
 
-      pessoa_id: string
+      pessoa_id: string | null
 
       proprietor_id: string | null
     }>(
@@ -140,11 +140,14 @@ try {
 
     const user = account.rows[0]
 
-    if (
-      user.tipo_pessoa !== "proprietario_adm" ||
-      !user.proprietor_id ||
-      user.pessoa_id !== user.proprietor_id
-    ) {
+    const isPlatformAdmin =
+      user.tipo_pessoa === "admin_plataforma" && user.pessoa_id === null
+    const isAdministrator =
+      user.tipo_pessoa === "proprietario_adm" &&
+      user.proprietor_id !== null &&
+      user.pessoa_id === user.proprietor_id
+
+    if (!isPlatformAdmin && !isAdministrator) {
       throw new Error(
         "Esta conta não está vinculada a um administrador e não pode acessar o sistema.",
       )

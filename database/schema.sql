@@ -115,8 +115,39 @@ CREATE TABLE IF NOT EXISTS public.usuarios (
   password_hash text NOT NULL,
   dt_criacao timestamptz NOT NULL DEFAULT now(),
   dt_alteracao timestamptz NOT NULL DEFAULT now(),
-  pessoa_id bigint NOT NULL,
+  pessoa_id bigint,
   tipo_pessoa text
 );
+
+ALTER TABLE public.usuarios
+  ALTER COLUMN pessoa_id DROP NOT NULL;
+
+ALTER TABLE public.proprietarios_adm
+  ADD COLUMN IF NOT EXISTS created_by_user_id bigint
+  REFERENCES public.usuarios(id) ON DELETE CASCADE;
+
+ALTER TABLE public.prepostos
+  ADD COLUMN IF NOT EXISTS created_by_user_id bigint
+  REFERENCES public.usuarios(id) ON DELETE CASCADE;
+
+ALTER TABLE public.prestadores_servico
+  ADD COLUMN IF NOT EXISTS created_by_user_id bigint
+  REFERENCES public.usuarios(id) ON DELETE CASCADE;
+
+CREATE INDEX IF NOT EXISTS idx_proprietarios_adm_created_by_user_id
+  ON public.proprietarios_adm (created_by_user_id);
+
+CREATE INDEX IF NOT EXISTS idx_prepostos_created_by_user_id
+  ON public.prepostos (created_by_user_id);
+
+CREATE INDEX IF NOT EXISTS idx_prestadores_servico_created_by_user_id
+  ON public.prestadores_servico (created_by_user_id);
+
+UPDATE public.proprietarios_adm pa
+SET created_by_user_id = u.id
+FROM public.usuarios u
+WHERE u.pessoa_id = pa.id
+  AND u.tipo_pessoa = 'proprietario_adm'
+  AND pa.created_by_user_id IS NULL;
 
 COMMIT;

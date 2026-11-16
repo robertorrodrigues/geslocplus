@@ -188,6 +188,19 @@ const proprietarioAdminRequired = (
   next()
 }
 
+const platformAdminRequired = (
+  req: Request,
+  _res: Response,
+  next: NextFunction,
+) => {
+  if (req.user?.personType !== "admin_plataforma") {
+    return next(
+      new ApiError(403, "Acesso restrito ao administrador da plataforma."),
+    )
+  }
+  next()
+}
+
 const positiveId = z.string().regex(/^[1-9]\d*$/, "Identificador inválido.")
 const maxImageBytes = 5 * 1024 * 1024
 const maxEquipmentPhotos = 10
@@ -203,9 +216,16 @@ const loginSchema = z.object({
 const signupSchema = z.object({
   fullName: z.string().trim().min(2).max(120),
   email: emailSchema,
-  password: z.string().min(8).max(128),
+  password: z.string().min(12).max(128),
   plan: z.enum(["mensal", "semestral", "anual"]).default("mensal"),
   paymentMethod: z.enum(["cartao", "boleto"]).default("cartao"),
+})
+
+const platformAdministratorSchema = z.object({
+  fullName: z.string().trim().min(2).max(160),
+  email: emailSchema.or(z.literal("")),
+  phone: z.string().trim().max(40).optional(),
+  cpfCnpj: z.string().trim().max(30).optional(),
 })
 
 const propertySchema = z.object({
@@ -364,7 +384,10 @@ app.post(
       throw new ApiError(401, "E-mail ou senha incorretos.")
     }
 
-    if (user.tipo_pessoa !== "proprietario_adm") {
+    if (
+      user.tipo_pessoa !== "proprietario_adm" &&
+      user.tipo_pessoa !== "admin_plataforma"
+    ) {
       throw new ApiError(
         403,
         "O acesso ao sistema é restrito a administradores.",
@@ -396,7 +419,15 @@ app.post(
     })
 
     res.json({
-      user: { id: String(user.id), fullName: user.nome, email: user.email },
+      user: {
+        id: String(user.id),
+        fullName: user.nome,
+        email: user.email,
+        role:
+          user.tipo_pessoa === "admin_plataforma"
+            ? "platform_admin"
+            : "administrator",
+      },
     })
   }),
 )
@@ -444,6 +475,13 @@ app.post(
       )
 
       const user = userResult.rows[0]
+      await client.query(
+        `UPDATE proprietarios_adm
+         SET created_by_user_id = $1
+         WHERE id = $2`,
+        [user.id, personResult.rows[0].id],
+      )
+
       const token = jwt.sign(
         {
           userId: String(user.id),
@@ -465,7 +503,12 @@ app.post(
       await client.query("COMMIT")
 
       res.status(201).json({
-        user: { id: String(user.id), fullName: user.nome, email: user.email },
+        user: {
+          id: String(user.id),
+          fullName: user.nome,
+          email: user.email,
+          role: "administrator",
+        },
         plan,
         paymentMethod,
       })
@@ -497,7 +540,7 @@ app.get(
     }
 
     const result = await pool.query(
-      "SELECT id, nome, email FROM usuarios WHERE id = $1",
+      "SELECT id, nome, email, tipo_pessoa FROM usuarios WHERE id = $1",
 
       [req.user.userId],
     )
@@ -517,8 +560,127 @@ app.get(
         fullName: result.rows[0].nome,
 
         email: result.rows[0].email,
+
+        role:
+          result.rows[0].tipo_pessoa === "admin_plataforma"
+            ? "platform_admin"
+            : "administrator",
       },
     })
+  }),
+)
+
+app.get(
+  "/api/platform/administrators",
+  authRequired,
+  platformAdminRequired,
+  asyncRoute(async (_req, res) => {
+    const result = await pool.query(
+      `SELECT pa.id::text AS id, pa.nome AS full_name,
+              coalesce(account.email, pa.email) AS email,
+              pa.telefone AS phone, pa.cpf_cnpj AS cpf_cnpj,
+              (account.id IS NOT NULL) AS has_account
+       FROM proprietarios_adm pa
+       LEFT JOIN LATERAL (
+         SELECT u.id, u.email
+         FROM usuarios u
+         WHERE u.pessoa_id = pa.id AND u.tipo_pessoa = 'proprietario_adm'
+         ORDER BY u.id
+         LIMIT 1
+       ) account ON TRUE
+       ORDER BY pa.nome, pa.id`,
+    )
+    res.json({ administrators: result.rows })
+  }),
+)
+
+app.patch(
+  "/api/platform/administrators/:id",
+  authRequired,
+  platformAdminRequired,
+  asyncRoute(async (req, res) => {
+    const id = positiveId.safeParse(req.params.id)
+    if (!id.success) throw new ApiError(400, "Identificador inválido.")
+
+    const parsed = platformAdministratorSchema.safeParse(req.body)
+    if (!parsed.success) {
+      throw new ApiError(400, "Confira os dados do administrador.")
+    }
+
+    const fullName = parsed.data.fullName
+    const email = parsed.data.email.trim().toLowerCase() || null
+    const phone = parsed.data.phone?.trim() || null
+    const cpfCnpj = parsed.data.cpfCnpj?.trim() || null
+
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+
+      const administrator = await client.query(
+        "SELECT id FROM proprietarios_adm WHERE id = $1 FOR UPDATE",
+        [id.data],
+      )
+      if (!administrator.rowCount) {
+        throw new ApiError(404, "Administrador não encontrado.")
+      }
+
+      const account = await client.query(
+        `SELECT id FROM usuarios
+         WHERE pessoa_id = $1 AND tipo_pessoa = 'proprietario_adm'
+         ORDER BY id LIMIT 1 FOR UPDATE`,
+        [id.data],
+      )
+
+      if (account.rowCount && !email) {
+        throw new ApiError(
+          400,
+          "Informe um e-mail para manter o acesso deste administrador.",
+        )
+      }
+
+      if (account.rowCount && email) {
+        const duplicate = await client.query(
+          `SELECT 1 FROM usuarios
+           WHERE lower(email) = lower($1) AND id <> $2
+           LIMIT 1`,
+          [email, account.rows[0].id],
+        )
+        if (duplicate.rowCount) {
+          throw new ApiError(409, "Já existe uma conta com este e-mail.")
+        }
+      }
+
+      const updated = await client.query(
+        `UPDATE proprietarios_adm
+         SET nome = $2, email = $3, telefone = $4, cpf_cnpj = $5
+         WHERE id = $1
+         RETURNING id::text AS id, nome AS full_name, email, telefone AS phone,
+                   cpf_cnpj, TRUE AS has_account`,
+        [id.data, fullName, email, phone, cpfCnpj],
+      )
+
+      if (account.rowCount) {
+        await client.query(
+          `UPDATE usuarios
+           SET nome = $1, email = $2, dt_alteracao = now()
+           WHERE id = $3`,
+          [fullName, email, account.rows[0].id],
+        )
+      }
+
+      await client.query("COMMIT")
+      res.json({
+        administrator: {
+          ...updated.rows[0],
+          has_account: Boolean(account.rowCount),
+        },
+      })
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
   }),
 )
 
@@ -585,6 +747,7 @@ app.get(
                 FROM proprietarios_adm_imoveis pai
                 JOIN proprietarios_adm pa ON pa.id = pai.proprietarios_adm_id
                 WHERE pai.imoveis_id = im.id
+                  AND pa.created_by_user_id = $1
               ), '[]'::json) AS owners,
               (SELECT count(*)::int FROM equipamentos e
                WHERE e.imovel_id = im.id) AS equipment_count,
@@ -656,6 +819,7 @@ app.get(
                 FROM proprietarios_adm_imoveis pai
                 JOIN proprietarios_adm pa ON pa.id = pai.proprietarios_adm_id
                 WHERE pai.imoveis_id = im.id
+                  AND pa.created_by_user_id = $2
               ), '[]'::json) AS owners,
               (SELECT count(*)::int FROM equipamentos e
                WHERE e.imovel_id = im.id) AS equipment_count
@@ -702,8 +866,9 @@ app.post(
       }
 
       const ownerCheck = await client.query(
-        "SELECT id FROM proprietarios_adm WHERE id = ANY($1::bigint[])",
-        [parsed.data.ownerIds],
+        `SELECT id FROM proprietarios_adm
+         WHERE id = ANY($1::bigint[]) AND created_by_user_id = $2`,
+        [parsed.data.ownerIds, req.user!.userId],
       )
       if (ownerCheck.rowCount !== parsed.data.ownerIds.length) {
         throw new ApiError(
@@ -776,8 +941,9 @@ app.patch(
       }
 
       const ownerCheck = await client.query(
-        "SELECT id FROM proprietarios_adm WHERE id = ANY($1::bigint[])",
-        [parsed.data.ownerIds],
+        `SELECT id FROM proprietarios_adm
+         WHERE id = ANY($1::bigint[]) AND created_by_user_id = $2`,
+        [parsed.data.ownerIds, req.user!.userId],
       )
       if (ownerCheck.rowCount !== parsed.data.ownerIds.length) {
         throw new ApiError(
@@ -1071,21 +1237,25 @@ app.delete(
 app.get(
   "/api/people",
 
-  asyncRoute(async (_req, res) => {
+  asyncRoute(async (req, res) => {
     const result = await pool.query(
       `SELECT 'proprietario_adm:' || id::text AS id, nome AS full_name,
               'administrator'::text AS kind, false AS is_broker, NULL::text AS creci,
               NULL::numeric AS commission_percent, '[]'::json AS properties
        FROM proprietarios_adm
+       WHERE created_by_user_id = $1
        UNION ALL
        SELECT 'preposto:' || id::text, nome, 'proxy'::text, false, NULL::text,
               NULL::numeric, '[]'::json
        FROM prepostos
+       WHERE created_by_user_id = $1
        UNION ALL
        SELECT 'prestador_servico:' || id::text, nome, 'provider'::text, false,
               NULL::text, NULL::numeric, '[]'::json
        FROM prestadores_servico
+       WHERE created_by_user_id = $1
        ORDER BY full_name`,
+      [req.user!.userId],
     )
 
     res.json({ people: result.rows })
@@ -1102,17 +1272,26 @@ app.post(
 
     const { fullName, email, phone, cpfCnpj, kind } = parsed.data
 
-    const params = [fullName, email || null, phone || null, cpfCnpj || null]
+    const params = [
+      fullName,
+      email || null,
+      phone || null,
+      cpfCnpj || null,
+      req.user!.userId,
+    ]
 
     const insertByKind = {
-      administrator: `INSERT INTO proprietarios_adm (nome, email, telefone, cpf_cnpj)
-                      VALUES ($1, $2, $3, $4) RETURNING id`,
+      administrator: `INSERT INTO proprietarios_adm
+                         (nome, email, telefone, cpf_cnpj, created_by_user_id)
+                       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
 
-      proxy: `INSERT INTO prepostos (nome, email, telefone, cpf_cnpj, tipo, status)
-              VALUES ($1, $2, $3, $4, 'preposto', 'ativo') RETURNING id`,
+      proxy: `INSERT INTO prepostos
+                (nome, email, telefone, cpf_cnpj, tipo, status, created_by_user_id)
+              VALUES ($1, $2, $3, $4, 'preposto', 'ativo', $5) RETURNING id`,
 
-      provider: `INSERT INTO prestadores_servico (nome, email, telefone, cpf_cnpj)
-                 VALUES ($1, $2, $3, $4) RETURNING id`,
+      provider: `INSERT INTO prestadores_servico
+                   (nome, email, telefone, cpf_cnpj, created_by_user_id)
+                 VALUES ($1, $2, $3, $4, $5) RETURNING id`,
     } satisfies Record<PersonKind, string>
 
     const result = await pool.query(insertByKind[kind], params)

@@ -129,8 +129,8 @@ export default function Login({
 
     setError("")
 
-    if (password.length < 8) {
-      setError("A senha deve ter no mínimo 8 caracteres.")
+    if (password.length < 12) {
+      setError("A senha deve ter no mínimo 12 caracteres.")
 
       return
     }
@@ -702,12 +702,12 @@ export default function Login({
                   type="password"
                   autoComplete="new-password"
                   required
-                  minLength={8}
+                  minLength={12}
                   maxLength={128}
                   value={password}
                   onChange={(event) => setPassword(event.target.value)}
                   className={inputClass}
-                  placeholder="Mínimo de 8 caracteres"
+                  placeholder="Mínimo de 12 caracteres"
                 />
               </div>
               <div>
@@ -722,7 +722,7 @@ export default function Login({
                   type="password"
                   autoComplete="new-password"
                   required
-                  minLength={8}
+                  minLength={12}
                   maxLength={128}
                   value={confirmPassword}
                   onChange={(event) => setConfirmPassword(event.target.value)}

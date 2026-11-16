@@ -138,9 +138,10 @@ try {
 
     const passwordHash = await bcrypt.hash(parsed.data.password, 12)
 
-    await client.query(
+    const user = await client.query(
       `INSERT INTO usuarios (nome, email, password_hash, pessoa_id, tipo_pessoa)
-       VALUES ($1, $2, $3, $4, $5)`,
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
 
       [
         person.rows[0].nome,
@@ -153,6 +154,13 @@ try {
 
         "proprietario_adm",
       ],
+    )
+
+    await client.query(
+      `UPDATE proprietarios_adm
+       SET created_by_user_id = $1
+       WHERE id = $2 AND created_by_user_id IS NULL`,
+      [user.rows[0].id, parsed.data.personId],
     )
 
     await client.query("COMMIT")

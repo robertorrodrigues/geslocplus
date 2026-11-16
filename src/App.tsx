@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type ChangeEvent } from "react"
 import { api, ApiError, initials, type AppUser } from "./api"
 import Login from "./Login"
+import PlatformAdminHome from "./PlatformAdminHome"
 
 type IconName = "home" | "building" | "check" | "users" | "bell" | "chevron" | "arrow" | "calendar" | "clock" | "pin" | "more" | "plus" | "search" | "filter" | "bed" | "sparkle" | "tool" | "key" | "wallet" | "briefcase" | "close" | "userPlus" | "clipboard"
 
@@ -405,7 +406,7 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (user) void loadAppData()
+    if (user?.role === "administrator") void loadAppData()
   }, [user])
 
   async function toggleTask(id: string) {
@@ -505,6 +506,9 @@ export default function App() {
         message={authMessage}
       />
     )
+  }
+  if (user.role === "platform_admin") {
+    return <PlatformAdminHome user={user} onLogout={() => void logout()} />
   }
 
   return (

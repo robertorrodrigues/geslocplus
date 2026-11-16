@@ -9,6 +9,7 @@
     "dev:api": "tsx watch server/index.ts",
     "start": "tsx server/index.ts",
     "create-admin": "tsx server/create-admin.ts",
+    "create-platform-admin": "tsx server/create-platform-admin.ts",
     "reset-password": "tsx server/reset-password.ts",
     "db:schema": "tsx server/run-schema.ts",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit",
