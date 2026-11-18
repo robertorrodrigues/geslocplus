@@ -15,6 +15,10 @@ type Plan = {
 
   description: string
 
+  additionalPropertyPrice: number
+
+  additionalPropertyCadence: string
+
   featured?: boolean
 }
 
@@ -24,11 +28,15 @@ const plans: Plan[] = [
 
     name: "Mensal",
 
-    price: 100,
+    price: 20,
 
     cadence: "por mês",
 
     description: "Flexibilidade para começar",
+
+    additionalPropertyPrice: 10,
+
+    additionalPropertyCadence: "por mês por imóvel adicional",
   },
 
   {
@@ -36,11 +44,16 @@ const plans: Plan[] = [
 
     name: "Semestral",
 
-    price: 550,
+    price: 90,
 
     cadence: "a cada 6 meses",
 
-    description: "Economize R$ 50 no período",
+    description: "Economize R$ 30 no período",
+
+    additionalPropertyPrice: 45,
+
+    additionalPropertyCadence:
+      "por imóvel adicional a cada 6 meses (25% de desconto)",
 
     featured: true,
   },
@@ -50,11 +63,16 @@ const plans: Plan[] = [
 
     name: "Anual",
 
-    price: 1000,
+    price: 144,
 
     cadence: "por ano",
 
-    description: "Economize R$ 200 no ano",
+    description: "Economize R$ 96 no ano",
+
+    additionalPropertyPrice: 72,
+
+    additionalPropertyCadence:
+      "por imóvel adicional por ano (40% de desconto)",
   },
 ]
 
@@ -79,10 +97,6 @@ export default function Login({
   const [view, setView] = useState<"landing" | "login">("landing")
 
   const [selectedPlanId, setSelectedPlanId] = useState<PlanId>("mensal")
-
-  const [paymentMethod, setPaymentMethod] = useState<"boleto" | "cartao">(
-    "cartao",
-  )
 
   const [fullName, setFullName] = useState("")
 
@@ -161,8 +175,6 @@ export default function Login({
           password,
 
           plan: selectedPlanId,
-
-          paymentMethod,
         }),
       })
 
@@ -571,6 +583,14 @@ export default function Login({
               <div className="my-6 h-px bg-[#eceee9]" />
               <ul className="mb-7 space-y-3 text-xs font-semibold text-[#596761]">
                 <li className="flex items-center gap-2">
+                  <CheckMark /> Até 3 imóveis incluídos
+                </li>
+                <li className="flex items-start gap-2">
+                  <CheckMark /> Imóvel adicional:{" "}
+                  {formatPrice(plan.additionalPropertyPrice)}{" "}
+                  {plan.additionalPropertyCadence}
+                </li>
+                <li className="flex items-center gap-2">
                   <CheckMark /> Todas as ferramentas incluídas
                 </li>
                 <li className="flex items-center gap-2">
@@ -633,8 +653,13 @@ export default function Login({
                 </p>
               </div>
               <p className="mt-4 border-t border-white/15 pt-4 text-[11px] leading-5 text-white/55">
-                A forma de pagamento é apenas uma preferência nesta etapa.
+                As formas de pagamento são apenas informativas nesta etapa.
                 Cobranças online ainda não estão habilitadas.
+              </p>
+              <p className="mt-2 text-[11px] leading-5 text-white/55">
+                Inclui até 3 imóveis. Imóvel adicional:{" "}
+                {formatPrice(selectedPlan.additionalPropertyPrice)}{" "}
+                {selectedPlan.additionalPropertyCadence}.
               </p>
             </div>
           </div>
@@ -733,23 +758,16 @@ export default function Login({
             </div>
             <div>
               <p className="mb-2 text-xs font-extrabold text-[#59645f]">
-                Forma de pagamento preferida
+                Formas de pagamentos disponíveis
               </p>
-              <div className="grid grid-cols-2 gap-2">
-                {(["cartao", "boleto"] as const).map((method) => (
-                  <button
+              <div className="grid grid-cols-3 gap-2">
+                {["Cartão", "Boleto", "PIX"].map((method) => (
+                  <div
                     key={method}
-                    type="button"
-                    aria-pressed={paymentMethod === method}
-                    onClick={() => setPaymentMethod(method)}
-                    className={`rounded-2xl border px-4 py-3 text-sm font-extrabold transition ${
-                      paymentMethod === method
-                        ? "border-[#173e37] bg-[#edf4f2] text-[#173e37]"
-                        : "border-[#dfded7] bg-white text-[#66736d]"
-                    }`}
+                    className="rounded-2xl border border-[#dfded7] bg-white px-3 py-3 text-center text-sm font-extrabold text-[#66736d]"
                   >
-                    {method === "cartao" ? "Cartão" : "Boleto"}
-                  </button>
+                    {method}
+                  </div>
                 ))}
               </div>
             </div>

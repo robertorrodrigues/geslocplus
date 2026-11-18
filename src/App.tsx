@@ -236,9 +236,13 @@ type Person = {
   name: string
   initials: string
   role: string
-  detail: string
+  email: string
+  phone: string
+  cpfCnpj: string
+  pixCode: string
   color: string
   kind: "administrator" | "proxy" | "provider"
+  isArchived: boolean
 }
 
 type Dashboard = {
@@ -276,6 +280,11 @@ type PersonResponse = {
   id: string
   full_name: string
   kind: Person["kind"]
+  email: string | null
+  phone: string | null
+  cpf_cnpj: string | null
+  pix_code: string | null
+  is_archived: boolean
 }
 
 type TaskResponse = {
@@ -412,6 +421,7 @@ export default function App() {
     null,
   )
   const [editingProperty, setEditingProperty] = useState<Property | null>(null)
+  const [editingPerson, setEditingPerson] = useState<Person | null>(null)
   const [taskEditorOpen, setTaskEditorOpen] = useState(false)
   const [editingTask, setEditingTask] = useState<OperationTask | null>(null)
   const [equipmentProperty, setEquipmentProperty] = useState<Property | null>(
@@ -493,7 +503,10 @@ export default function App() {
             name: item.full_name,
             initials: initials(item.full_name),
             role: roles[(item.kind as Person["kind"])],
-            detail: "Cadastro sem vínculo com imóvel",
+            email: item.email || "",
+            phone: item.phone || "",
+            cpfCnpj: item.cpf_cnpj || "",
+            pixCode: item.pix_code || "",
             color:
               item.kind === "administrator"
                 ? "coral"
@@ -501,6 +514,7 @@ export default function App() {
                   ? "green"
                   : "purple",
             kind: item.kind,
+            isArchived: item.is_archived,
           }
         }),
       )
@@ -690,24 +704,52 @@ export default function App() {
   }
 
   async function saveRecord(data: Record<string, unknown>, recordId?: string) {
-    const path =
-      recordId || tab === "properties"
-        ? `/properties${recordId ? `/${encodeURIComponent(recordId)}` : ""}`
-        : tab === "operation"
-          ? "/checklists"
-          : "/people"
+    const isPropertyRecord = tab === "properties" || Boolean(editingProperty)
+    const path = isPropertyRecord
+      ? `/properties${recordId ? `/${encodeURIComponent(recordId)}` : ""}`
+      : tab === "operation"
+        ? "/checklists"
+        : `/people${recordId ? `/${encodeURIComponent(recordId)}` : ""}`
     await api(path, {
       method: recordId ? "PATCH" : "POST",
       body: JSON.stringify(data),
     })
     setShowAdd(false)
     setEditingProperty(null)
+    setEditingPerson(null)
     flash(
-      recordId
+      isPropertyRecord && recordId
         ? "Imóvel atualizado com sucesso."
-        : "Cadastro salvo com sucesso.",
+        : tab === "people" && recordId
+          ? "Pessoa atualizada com sucesso."
+          : "Cadastro salvo com sucesso.",
     )
     await loadAppData()
+  }
+
+  async function setPersonArchived(person: Person, archived: boolean) {
+    const action = archived ? "arquivar" : "reativar"
+    if (
+      archived &&
+      !window.confirm(`Arquivar "${person.name}"? O histórico será mantido.`)
+    ) {
+      return
+    }
+
+    try {
+      await api(`/people/${encodeURIComponent(person.id)}/status`, {
+        method: "PATCH",
+        body: JSON.stringify({ archived }),
+      })
+      flash(archived ? "Pessoa arquivada." : "Pessoa reativada.")
+      await loadAppData()
+    } catch (error) {
+      flash(
+        error instanceof Error
+          ? error.message
+          : `Não foi possível ${action} a pessoa.`,
+      )
+    }
   }
 
   async function addChecklistTemplate(templateId: string) {
@@ -747,6 +789,7 @@ export default function App() {
       setChecklists([])
       setChecklistTemplates([])
       setDashboard(emptyDashboard)
+      setEditingPerson(null)
       setTaskEditorOpen(false)
       setEditingTask(null)
     } catch (error) {
@@ -889,7 +932,16 @@ export default function App() {
               filter={personFilter}
               setFilter={setPersonFilter}
               people={people}
-              onAdd={() => setShowAdd(true)}
+              onAdd={() => {
+                setEditingPerson(null)
+                setShowAdd(true)
+              }}
+              onEdit={(person) => {
+                setEditingPerson(person)
+                setShowAdd(false)
+              }}
+              onArchive={(person) => void setPersonArchived(person, true)}
+              onReactivate={(person) => void setPersonArchived(person, false)}
             />
           )}
         </div>
@@ -906,15 +958,17 @@ export default function App() {
             }}
           />
         )}
-        {(showAdd || editingProperty) && (
+        {(showAdd || editingProperty || editingPerson) && (
           <AddSheet
             context={editingProperty ? "properties" : tab}
             people={people}
             initialProperty={editingProperty || undefined}
+            initialPerson={editingPerson || undefined}
             onManageEquipment={setEquipmentProperty}
             onClose={() => {
               setShowAdd(false)
               setEditingProperty(null)
+              setEditingPerson(null)
             }}
             onSave={saveRecord}
           />
@@ -925,7 +979,6 @@ export default function App() {
             properties={properties}
             people={people}
             checklists={checklists}
-            templates={checklistTemplates}
             onClose={() => {
               setTaskEditorOpen(false)
               setEditingTask(null)
@@ -1062,7 +1115,8 @@ function HomeScreen({
   onSeeOperation: () => void
   onSeeProperties: () => void
 }) {
-  const completed = tasks.filter((task) => task.done).length
+  const operationTasks = tasks.filter((task) => task.category === "operation")
+  const completed = operationTasks.filter((task) => task.done).length
   return (
     <>
       <section className="mx-5 overflow-hidden rounded-[28px] bg-[#173e37] p-5 text-white shadow-[0_18px_40px_rgba(20,58,51,.2)]">
@@ -1099,13 +1153,18 @@ function HomeScreen({
           onAction={onSeeOperation}
         />
         <div className="mt-3 space-y-2.5">
-          {tasks.map((task) => (
+          {operationTasks.map((task) => (
             <TaskRow
               key={task.id}
               task={task}
               onToggle={() => onToggleTask(task.id)}
             />
           ))}
+          {!operationTasks.length && (
+            <p className="rounded-2xl border border-[#ebe9e1] bg-white p-4 text-xs font-semibold text-[#89918d]">
+              Nenhuma tarefa cadastrada.
+            </p>
+          )}
         </div>
         {completed > 0 && (
           <p className="mt-3 text-center text-xs font-semibold text-[#64706c]">
@@ -1397,6 +1456,21 @@ function OperationScreen({
 }) {
   const [addingTemplateId, setAddingTemplateId] = useState("")
   const [actionError, setActionError] = useState("")
+  const [historyStatus, setHistoryStatus] = useState<
+    OperationTaskStatus | "todos"
+  >("todos")
+
+  const historyTasks = tasks
+    .filter(
+      (task) => historyStatus === "todos" || task.status === historyStatus,
+    )
+    .sort((first, second) => {
+      if (!first.end_at) return second.end_at ? 1 : 0
+      if (!second.end_at) return -1
+      return (
+        new Date(second.end_at).getTime() - new Date(first.end_at).getTime()
+      )
+    })
 
   async function addTemplate(templateId: string) {
     setAddingTemplateId(templateId)
@@ -1417,7 +1491,7 @@ function OperationScreen({
   return (
     <section className="px-5">
       <div className="mb-6 flex rounded-2xl bg-[#ebeae4] p-1">
-        {["Tarefas", "Checklists"].map((item) => (
+        {["Tarefas", "Histórico", "Checklists"].map((item) => (
           <button
             key={item}
             onClick={() => setFilter(item)}
@@ -1437,23 +1511,29 @@ function OperationScreen({
             <p className="text-xs font-bold text-[#8d9591]">
               {filter === "Tarefas"
                 ? "Imóveis, executores e checklists em um só lugar"
-                : "Modelos padrão e sua lista pessoal"}
+                : filter === "Histórico"
+                  ? "Consulta de todas as tarefas"
+                  : "Modelos padrão e sua lista pessoal"}
             </p>
             <h2 className="mt-1 text-xl font-extrabold">
               {filter === "Tarefas"
                 ? `${tasks.filter((task) => isTaskPending(task.status)).length} tarefas pendentes`
-                : `${checklists.length} checklists na sua lista`}
+                : filter === "Histórico"
+                  ? `${historyTasks.length} tarefas registradas`
+                  : `${checklists.length} checklists na sua lista`}
             </h2>
           </div>
-          <button
-            onClick={filter === "Tarefas" ? onAddTask : onAddChecklist}
-            aria-label={
-              filter === "Tarefas" ? "Criar tarefa" : "Criar checklist"
-            }
-            className="flex h-10 w-10 items-center justify-center rounded-full bg-[#ed765f] text-white shadow-lg"
-          >
-            <Icon name="plus" />
-          </button>
+          {filter !== "Histórico" && (
+            <button
+              onClick={filter === "Tarefas" ? onAddTask : onAddChecklist}
+              aria-label={
+                filter === "Tarefas" ? "Criar tarefa" : "Criar checklist"
+              }
+              className="flex h-10 w-10 items-center justify-center rounded-full bg-[#ed765f] text-white shadow-lg"
+            >
+              <Icon name="plus" />
+            </button>
+          )}
         </div>
         {filter === "Tarefas" ? (
           <div className="space-y-3">
@@ -1471,6 +1551,72 @@ function OperationScreen({
               <p className="rounded-2xl border border-[#ebe9e1] bg-white p-4 text-xs font-semibold text-[#89918d]">
                 Nenhuma tarefa cadastrada. Crie uma tarefa para vinculá-la a um
                 imóvel.
+              </p>
+            )}
+          </div>
+        ) : filter === "Histórico" ? (
+          <div className="space-y-3">
+            <label className="block">
+              <span className="field-label">Filtrar por status</span>
+              <select
+                value={historyStatus}
+                onChange={(event) => {
+                  const selected =
+                    event.target.value === "todos"
+                      ? "todos"
+                      : operationTaskStatuses.find(
+                          (status) => status.value === event.target.value,
+                        )?.value
+                  if (selected) setHistoryStatus(selected)
+                }}
+                className="w-full rounded-2xl border border-[#dfded7] bg-white px-4 py-3 text-xs font-bold outline-none focus:border-[#34705d]"
+              >
+                <option value="todos">Todos os status</option>
+                {operationTaskStatuses.map((status) => (
+                  <option key={status.value} value={status.value}>
+                    {status.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {historyTasks.map((task) => {
+                const status = operationTaskStatuses.find(
+                  (item) => item.value === task.status,
+                )
+                return (
+                  <article
+                    key={task.id}
+                    className="rounded-[20px] border border-[#ebe9e1] bg-white p-4"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <h3 className="text-sm font-extrabold text-[#20352f]">
+                        {task.name}
+                      </h3>
+                      <span className="shrink-0 rounded-full bg-[#edf4ef] px-2.5 py-1 text-[9px] font-extrabold text-[#34705d]">
+                        {status?.label || task.status}
+                      </span>
+                    </div>
+                    <p className="mt-2 text-xs font-semibold text-[#64706a]">
+                      Imóvel: {task.property_name}
+                    </p>
+                    <p className="mt-1 text-[10px] font-semibold text-[#89938d]">
+                      Data de fim:{" "}
+                      {task.end_at
+                        ? new Date(task.end_at).toLocaleString("pt-BR", {
+                            day: "2-digit",
+                            month: "2-digit",
+                            year: "numeric",
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          })
+                        : "Não definida"}
+                    </p>
+                  </article>
+                )
+              })}
+            {!historyTasks.length && (
+              <p className="rounded-2xl border border-[#ebe9e1] bg-white p-4 text-xs font-semibold text-[#89918d]">
+                Nenhuma tarefa encontrada para esse status.
               </p>
             )}
           </div>
@@ -1755,7 +1901,6 @@ function TaskEditorSheet({
   properties,
   people,
   checklists,
-  templates,
   onClose,
   onSave,
 }: {
@@ -1763,7 +1908,6 @@ function TaskEditorSheet({
   properties: Property[]
   people: Person[]
   checklists: PersonalChecklist[]
-  templates: ChecklistTemplate[]
   onClose: () => void
   onSave: (data: OperationTaskPayload) => Promise<void>
 }) {
@@ -1779,10 +1923,6 @@ function TaskEditorSheet({
 
   const checklistOptions = useMemo(() => {
     const options = [
-      ...templates.map((checklist) => ({
-        id: checklist.id,
-        title: checklist.title,
-      })),
       ...checklists.map((checklist) => ({
         id: checklist.id,
         title: checklist.title,
@@ -1797,12 +1937,24 @@ function TaskEditorSheet({
       }
     }
     return options
-  }, [checklists, task, templates])
+  }, [checklists, task])
 
-  const executors = people.filter(
+  const activeExecutors = people.filter(
     (person) =>
-      person.kind === "administrator" || person.kind === "provider",
+      !person.isArchived &&
+      (person.kind === "administrator" || person.kind === "provider"),
   )
+  const archivedCurrentExecutor = task
+    ? people.find(
+        (person) =>
+          person.isArchived &&
+          person.kind === task.executor_type &&
+          person.id.split(":").pop() === task.executor_id,
+      )
+    : undefined
+  const executors = archivedCurrentExecutor
+    ? [...activeExecutors, archivedCurrentExecutor]
+    : activeExecutors
 
   useEffect(() => {
     setName(task?.name || "")
@@ -1958,6 +2110,7 @@ function TaskEditorSheet({
                       {person.kind === "administrator"
                         ? "Administrador"
                         : "Prestador de serviços"}
+                      {person.isArchived ? " (arquivado)" : ""}
                     </option>
                   )
                 })}
@@ -2329,21 +2482,26 @@ function PeopleScreen({
   setFilter,
   people,
   onAdd,
+  onEdit,
+  onArchive,
+  onReactivate,
 }: {
   filter: string
   setFilter: (value: string) => void
   people: Person[]
   onAdd: () => void
+  onEdit: (person: Person) => void
+  onArchive: (person: Person) => void
+  onReactivate: (person: Person) => void
 }) {
-  const filtered = people.filter(
-    (person) =>
-      filter === "Todos" ||
-      (filter === "Admins"
-        ? person.kind === "administrator"
-        : filter === "Prepostos"
-          ? person.kind === "proxy"
-          : person.kind === "provider"),
-  )
+  const [showArchived, setShowArchived] = useState(false)
+  const filtered = people.filter((person) => {
+    if (person.isArchived !== showArchived) return false
+    if (filter === "Todos") return true
+    if (filter === "Admins") return person.kind === "administrator"
+    if (filter === "Prepostos") return person.kind === "proxy"
+    return person.kind === "provider"
+  })
   return (
     <section>
       <div className="px-5">
@@ -2378,20 +2536,32 @@ function PeopleScreen({
       </div>
       <div className="mx-5 mb-5 rounded-[20px] bg-[#e7f0eb] p-4">
         <p className="text-[11px] font-bold leading-relaxed text-[#48645d]">
-          Cadastros de administradores, prepostos e prestadores são independentes
-          dos imóveis no schema atual.
+          Arquivar mantém tarefas, vínculos e histórico. Marque “Mostrar
+          excluídos” para reativar uma pessoa.
         </p>
       </div>
       <div className="px-5">
-        <h2 className="mb-3 text-sm font-extrabold">
-          {filtered.length} pessoas
-        </h2>
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <h2 className="text-sm font-extrabold">{filtered.length} pessoas</h2>
+          <label className="flex shrink-0 items-center gap-2 text-[10px] font-bold text-[#59645f]">
+            <input
+              type="checkbox"
+              checked={showArchived}
+              onChange={(event) => setShowArchived(event.target.checked)}
+              className="h-4 w-4 accent-[#173e37]"
+            />
+            Mostrar excluídos
+          </label>
+        </div>
         <div className="overflow-hidden rounded-[24px] border border-[#e5e3dc] bg-white">
           {filtered.map((person, index) => (
             <PersonRow
-              key={person.name}
+              key={person.id}
               person={person}
               last={index === filtered.length - 1}
+              onEdit={() => onEdit(person)}
+              onArchive={() => onArchive(person)}
+              onReactivate={() => onReactivate(person)}
             />
           ))}
           {!filtered.length && (
@@ -2405,7 +2575,19 @@ function PeopleScreen({
   )
 }
 
-function PersonRow({ person, last }: { person: Person; last: boolean }) {
+function PersonRow({
+  person,
+  last,
+  onEdit,
+  onArchive,
+  onReactivate,
+}: {
+  person: Person
+  last: boolean
+  onEdit: () => void
+  onArchive: () => void
+  onReactivate: () => void
+}) {
   const colors: Record<string, string> = {
     coral: "bg-[#f9d8d0] text-[#b8523e]",
     navy: "bg-[#dce7e4] text-[#234e45]",
@@ -2414,23 +2596,69 @@ function PersonRow({ person, last }: { person: Person; last: boolean }) {
     purple: "bg-[#e9e2f3] text-[#67578b]",
   }
   return (
-    <button
-      className={`flex w-full items-center gap-3 p-4 text-left ${
+    <article
+      className={`p-4 ${
         last ? "" : "border-b border-[#eeece6]"
       }`}
     >
-      <div className={`avatar ${colors[person.color]}`}>{person.initials}</div>
-      <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-extrabold">{person.name}</p>
-        <p className="mt-1 truncate text-[10px] font-semibold text-[#8a928f]">
-          {person.role}
-        </p>
-        <p className="mt-1 text-[9px] font-bold text-[#d7624c]">
-          {person.detail}
-        </p>
+      <div className="flex items-start gap-3">
+        <div className={`avatar ${colors[person.color]}`}>{person.initials}</div>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="truncate text-sm font-extrabold">{person.name}</p>
+            {person.isArchived && (
+              <span className="rounded-full bg-[#f0eee7] px-2 py-0.5 text-[8px] font-extrabold uppercase tracking-wide text-[#7b7062]">
+                Excluído
+              </span>
+            )}
+          </div>
+          <p className="mt-1 truncate text-[10px] font-semibold text-[#8a928f]">
+            {person.role}
+          </p>
+          {person.email && (
+            <p className="mt-1 truncate text-[9px] font-semibold text-[#64706a]">
+              {person.email}
+            </p>
+          )}
+          {person.phone && (
+            <p className="mt-1 text-[9px] font-semibold text-[#64706a]">
+              {person.phone}
+            </p>
+          )}
+          {person.kind === "provider" && person.pixCode && (
+            <p className="mt-1 break-all text-[9px] font-semibold text-[#64706a]">
+              PIX: {person.pixCode}
+            </p>
+          )}
+        </div>
       </div>
-      <Icon name="chevron" size={16} className="text-[#a4aaa7]" />
-    </button>
+      <div className="mt-3 flex justify-end gap-2">
+        <button
+          type="button"
+          onClick={onEdit}
+          className="rounded-xl border border-[#dfe2db] px-3 py-2 text-[10px] font-extrabold text-[#34705d]"
+        >
+          Alterar
+        </button>
+        {person.isArchived ? (
+          <button
+            type="button"
+            onClick={onReactivate}
+            className="rounded-xl bg-[#e7f0eb] px-3 py-2 text-[10px] font-extrabold text-[#34705d]"
+          >
+            Reativar
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={onArchive}
+            className="rounded-xl bg-[#fff1ec] px-3 py-2 text-[10px] font-extrabold text-[#a84734]"
+          >
+            Arquivar
+          </button>
+        )}
+      </div>
+    </article>
   )
 }
 
@@ -2968,6 +3196,7 @@ function AddSheet({
   context,
   people,
   initialProperty,
+  initialPerson,
   onManageEquipment,
   onClose,
   onSave,
@@ -2975,6 +3204,7 @@ function AddSheet({
   context: Tab
   people: Person[]
   initialProperty?: Property
+  initialPerson?: Person
   onManageEquipment: (property: Property) => void
   onClose: () => void
   onSave: (data: Record<string, unknown>, recordId?: string) => Promise<void>
@@ -2986,8 +3216,17 @@ function AddSheet({
         : "Novo imóvel"
       : context === "operation"
         ? "Novo checklist"
-        : "Nova pessoa"
-  const [role, setRole] = useState("Preposto")
+        : initialPerson
+          ? "Editar pessoa"
+          : "Nova pessoa"
+  const personRoles: Record<Person["kind"], string> = {
+    administrator: "Admin",
+    proxy: "Preposto",
+    provider: "Prestador",
+  }
+  const [role, setRole] = useState(
+    initialPerson ? personRoles[initialPerson.kind] : "Preposto",
+  )
   const [values, setValues] = useState<Record<string, string>>(
     (): Record<string, string> =>
       initialProperty
@@ -2998,6 +3237,14 @@ function AddSheet({
             city: initialProperty.city,
             state: initialProperty.state,
           }
+        : initialPerson
+          ? {
+              fullName: initialPerson.name,
+              email: initialPerson.email,
+              phone: initialPerson.phone,
+              cpfCnpj: initialPerson.cpfCnpj,
+              pixCode: initialPerson.pixCode,
+            }
         : {},
   )
   const [selectedOwnerIds, setSelectedOwnerIds] = useState<string[]>(
@@ -3083,7 +3330,8 @@ function AddSheet({
           phone: values.phone || "",
           cpfCnpj: values.cpfCnpj || "",
           kind: kinds[role],
-        })
+          pixCode: role === "Prestador" ? values.pixCode || "" : "",
+        }, initialPerson?.id)
       }
     } catch (reason) {
       setError(
@@ -3095,9 +3343,16 @@ function AddSheet({
   }
 
   const availableOwners = people.filter(
-    (person) =>
-      person.kind === "administrator" &&
-      person.id.startsWith("proprietario_adm:"),
+    (person) => {
+      if (
+        person.kind !== "administrator" ||
+        !person.id.startsWith("proprietario_adm:")
+      ) {
+        return false
+      }
+      const ownerId = person.id.slice("proprietario_adm:".length)
+      return !person.isArchived || selectedOwnerIds.includes(ownerId)
+    },
   )
 
   return (
@@ -3285,24 +3540,39 @@ function AddSheet({
               value={values.cpfCnpj || ""}
               onChange={(value) => setValue("cpfCnpj", value)}
             />
-            <div>
-              <label className="field-label">Papel no negócio</label>
-              <div className="grid grid-cols-3 gap-2">
-                {["Admin", "Preposto", "Prestador"].map((item) => (
-                  <button
-                    key={item}
-                    onClick={() => setRole(item)}
-                    className={`rounded-xl border px-2 py-3 text-[10px] font-extrabold ${
-                      role === item
-                        ? "border-[#173e37] bg-[#173e37] text-white"
-                        : "border-[#deded7] bg-white text-[#6f7975]"
-                    }`}
-                  >
-                    {item}
-                  </button>
-                ))}
+            {role === "Prestador" && (
+              <Field
+                label="Código PIX"
+                placeholder="Informe a chave ou código PIX"
+                value={values.pixCode || ""}
+                onChange={(value) => setValue("pixCode", value)}
+                maxLength={200}
+              />
+            )}
+            {initialPerson ? (
+              <p className="rounded-2xl bg-[#e7f0eb] p-3 text-xs font-bold text-[#48645d]">
+                Papel no negócio: {initialPerson.role}
+              </p>
+            ) : (
+              <div>
+                <label className="field-label">Papel no negócio</label>
+                <div className="grid grid-cols-3 gap-2">
+                  {["Admin", "Preposto", "Prestador"].map((item) => (
+                    <button
+                      key={item}
+                      onClick={() => setRole(item)}
+                      className={`rounded-xl border px-2 py-3 text-[10px] font-extrabold ${
+                        role === item
+                          ? "border-[#173e37] bg-[#173e37] text-white"
+                          : "border-[#deded7] bg-white text-[#6f7975]"
+                      }`}
+                    >
+                      {item}
+                    </button>
+                  ))}
+                </div>
               </div>
-            </div>
+            )}
           </div>
         )}
         {error && (
@@ -3321,7 +3591,11 @@ function AddSheet({
           }
           className="primary-button mt-7 disabled:opacity-60"
         >
-          {saving ? "Salvando..." : "Salvar cadastro"}
+          {saving
+            ? "Salvando..."
+            : initialPerson
+              ? "Salvar alterações"
+              : "Salvar cadastro"}
           <Icon name="arrow" size={18} />
         </button>
       </div>

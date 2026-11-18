@@ -206,6 +206,16 @@ ALTER TABLE public.prestadores_servico
   ADD COLUMN IF NOT EXISTS created_by_user_id bigint
   REFERENCES public.usuarios(id) ON DELETE CASCADE;
 
+ALTER TABLE public.proprietarios_adm
+  ADD COLUMN IF NOT EXISTS archived_at timestamptz;
+
+ALTER TABLE public.prepostos
+  ADD COLUMN IF NOT EXISTS archived_at timestamptz;
+
+ALTER TABLE public.prestadores_servico
+  ADD COLUMN IF NOT EXISTS archived_at timestamptz,
+  ADD COLUMN IF NOT EXISTS codigo_pix text;
+
 CREATE INDEX IF NOT EXISTS idx_proprietarios_adm_created_by_user_id
   ON public.proprietarios_adm (created_by_user_id);
 

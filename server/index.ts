@@ -218,7 +218,6 @@ const signupSchema = z.object({
   email: emailSchema,
   password: z.string().min(12).max(128),
   plan: z.enum(["mensal", "semestral", "anual"]).default("mensal"),
-  paymentMethod: z.enum(["cartao", "boleto"]).default("cartao"),
 })
 
 const platformAdministratorSchema = z.object({
@@ -302,6 +301,16 @@ const personSchema = z.object({
   phone: z.string().trim().max(40).optional(),
 
   cpfCnpj: z.string().trim().max(30).optional(),
+
+  pixCode: z.string().trim().max(200).optional(),
+})
+
+const personUpdateSchema = z.object({
+  fullName: z.string().trim().min(2).max(160),
+  email: emailSchema.optional().or(z.literal("")),
+  phone: z.string().trim().max(40).optional(),
+  cpfCnpj: z.string().trim().max(30).optional(),
+  pixCode: z.string().trim().max(200).optional(),
 })
 
 const operationTaskSchema = z
@@ -349,18 +358,21 @@ async function requireTaskExecutor(
   executorType: "administrator" | "provider",
   executorId: string,
   client: PoolClient,
+  allowArchived = false,
 ) {
   const result =
     executorType === "administrator"
       ? await client.query(
           `SELECT id FROM proprietarios_adm
-           WHERE id = $1 AND created_by_user_id = $2`,
-          [executorId, userId],
+           WHERE id = $1 AND created_by_user_id = $2
+             AND ($3::boolean OR archived_at IS NULL)`,
+          [executorId, userId, allowArchived],
         )
       : await client.query(
           `SELECT id FROM prestadores_servico
-           WHERE id = $1 AND created_by_user_id = $2`,
-          [executorId, userId],
+           WHERE id = $1 AND created_by_user_id = $2
+             AND ($3::boolean OR archived_at IS NULL)`,
+          [executorId, userId, allowArchived],
         )
 
   if (!result.rowCount) {
@@ -597,7 +609,7 @@ app.post(
       throw new ApiError(400, "Informe um nome, e-mail e senha válidos.")
     }
 
-    const { fullName, email, password, plan, paymentMethod } = parsed.data
+    const { fullName, email, password, plan } = parsed.data
 
     const existingUser = await pool.query(
       `SELECT 1 FROM usuarios WHERE lower(email) = lower($1) LIMIT 1`,
@@ -665,7 +677,6 @@ app.post(
           role: "administrator",
         },
         plan,
-        paymentMethod,
       })
     } catch (error) {
       await client.query("ROLLBACK")
@@ -1466,18 +1477,19 @@ app.get(
   asyncRoute(async (req, res) => {
     const result = await pool.query(
       `SELECT 'proprietario_adm:' || id::text AS id, nome AS full_name,
-              'administrator'::text AS kind, false AS is_broker, NULL::text AS creci,
-              NULL::numeric AS commission_percent, '[]'::json AS properties
+              'administrator'::text AS kind, email, telefone AS phone,
+              cpf_cnpj, NULL::text AS pix_code,
+              archived_at IS NOT NULL AS is_archived
        FROM proprietarios_adm
        WHERE created_by_user_id = $1
        UNION ALL
-       SELECT 'preposto:' || id::text, nome, 'proxy'::text, false, NULL::text,
-              NULL::numeric, '[]'::json
+       SELECT 'preposto:' || id::text, nome, 'proxy'::text, email,
+              telefone, cpf_cnpj, NULL::text, archived_at IS NOT NULL
        FROM prepostos
        WHERE created_by_user_id = $1
        UNION ALL
-       SELECT 'prestador_servico:' || id::text, nome, 'provider'::text, false,
-              NULL::text, NULL::numeric, '[]'::json
+       SELECT 'prestador_servico:' || id::text, nome, 'provider'::text, email,
+              telefone, cpf_cnpj, codigo_pix, archived_at IS NOT NULL
        FROM prestadores_servico
        WHERE created_by_user_id = $1
        ORDER BY full_name`,
@@ -1496,7 +1508,7 @@ app.post(
 
     if (!parsed.success) throw new ApiError(400, "Confira os dados da pessoa.")
 
-    const { fullName, email, phone, cpfCnpj, kind } = parsed.data
+    const { fullName, email, phone, cpfCnpj, pixCode, kind } = parsed.data
 
     const params = [
       fullName,
@@ -1516,13 +1528,122 @@ app.post(
               VALUES ($1, $2, $3, $4, 'preposto', 'ativo', $5) RETURNING id`,
 
       provider: `INSERT INTO prestadores_servico
-                   (nome, email, telefone, cpf_cnpj, created_by_user_id)
-                 VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+                   (nome, email, telefone, cpf_cnpj, codigo_pix, created_by_user_id)
+                 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
     } satisfies Record<PersonKind, string>
 
-    const result = await pool.query(insertByKind[kind], params)
+    const result =
+      kind === "provider"
+        ? await pool.query(insertByKind.provider, [
+            fullName,
+            email || null,
+            phone || null,
+            cpfCnpj || null,
+            pixCode || null,
+            req.user!.userId,
+          ])
+        : await pool.query(insertByKind[kind], params)
 
-    res.status(201).json({ id: `${kind}:${result.rows[0].id}` })
+    const prefixes: Record<PersonKind, string> = {
+      administrator: "proprietario_adm",
+      proxy: "preposto",
+      provider: "prestador_servico",
+    }
+    res.status(201).json({ id: `${prefixes[kind]}:${result.rows[0].id}` })
+  }),
+)
+
+app.patch(
+  "/api/people/:id",
+  asyncRoute(async (req, res) => {
+    const match =
+      typeof req.params.id === "string"
+        ? /^(proprietario_adm|preposto|prestador_servico):([1-9]\d*)$/.exec(
+            req.params.id,
+          )
+        : null
+    const parsed = personUpdateSchema.safeParse(req.body)
+    if (!match) throw new ApiError(400, "Identificador de pessoa inválido.")
+    if (!parsed.success) throw new ApiError(400, "Confira os dados da pessoa.")
+
+    const [, prefix, id] = match
+    const tables = {
+      proprietario_adm: "proprietarios_adm",
+      preposto: "prepostos",
+      prestador_servico: "prestadores_servico",
+    } as const
+    const table =
+      prefix === "proprietario_adm"
+        ? tables.proprietario_adm
+        : prefix === "preposto"
+          ? tables.preposto
+          : tables.prestador_servico
+    const values = [
+      parsed.data.fullName,
+      parsed.data.email || null,
+      parsed.data.phone || null,
+      parsed.data.cpfCnpj || null,
+    ]
+    const result =
+      prefix === "prestador_servico"
+        ? await pool.query(
+            `UPDATE ${table}
+             SET nome = $1, email = $2, telefone = $3, cpf_cnpj = $4,
+                 codigo_pix = $5
+             WHERE id = $6 AND created_by_user_id = $7
+             RETURNING id`,
+            [...values, parsed.data.pixCode || null, id, req.user!.userId],
+          )
+        : await pool.query(
+            `UPDATE ${table}
+             SET nome = $1, email = $2, telefone = $3, cpf_cnpj = $4
+             WHERE id = $5 AND created_by_user_id = $6
+             RETURNING id`,
+            [...values, id, req.user!.userId],
+          )
+
+    if (!result.rowCount) throw new ApiError(404, "Pessoa não encontrada.")
+    res.status(204).end()
+  }),
+)
+
+app.patch(
+  "/api/people/:id/status",
+  asyncRoute(async (req, res) => {
+    const match =
+      typeof req.params.id === "string"
+        ? /^(proprietario_adm|preposto|prestador_servico):([1-9]\d*)$/.exec(
+            req.params.id,
+          )
+        : null
+    const parsed = z.object({ archived: z.boolean() }).safeParse(req.body)
+    if (!match) throw new ApiError(400, "Identificador de pessoa inválido.")
+    if (!parsed.success) throw new ApiError(400, "Estado de pessoa inválido.")
+
+    const [, prefix, id] = match
+    const tables = {
+      proprietario_adm: "proprietarios_adm",
+      preposto: "prepostos",
+      prestador_servico: "prestadores_servico",
+    } as const
+    const table =
+      prefix === "proprietario_adm"
+        ? tables.proprietario_adm
+        : prefix === "preposto"
+          ? tables.preposto
+          : tables.prestador_servico
+    const result = await pool.query(
+      `UPDATE ${table}
+       SET archived_at = CASE
+         WHEN $1 THEN coalesce(archived_at, now())
+         ELSE NULL
+       END
+       WHERE id = $2 AND created_by_user_id = $3
+       RETURNING id`,
+      [parsed.data.archived, id, req.user!.userId],
+    )
+    if (!result.rowCount) throw new ApiError(404, "Pessoa não encontrada.")
+    res.status(204).end()
   }),
 )
 
@@ -1651,12 +1772,20 @@ app.patch(
     try {
       await client.query("BEGIN")
       const currentTask = await client.query(
-        `SELECT id FROM tarefas_operacao
+        `SELECT id, executor_tipo, executor_administrador_id::text AS administrator_id,
+                executor_prestador_id::text AS provider_id
+         FROM tarefas_operacao
          WHERE id = $1 AND created_by_user_id = $2
          FOR UPDATE`,
         [id.data, req.user!.userId],
       )
       if (!currentTask.rowCount) throw new ApiError(404, "Tarefa não encontrada.")
+      const currentExecutor = currentTask.rows[0]
+      const executorUnchanged =
+        currentExecutor.executor_tipo === parsed.data.executorType &&
+        (parsed.data.executorType === "administrator"
+          ? currentExecutor.administrator_id === parsed.data.executorId
+          : currentExecutor.provider_id === parsed.data.executorId)
 
       await requirePropertyAccess(
         req.user!.userId,
@@ -1668,6 +1797,7 @@ app.patch(
         parsed.data.executorType,
         parsed.data.executorId,
         client,
+        executorUnchanged,
       )
       await client.query(
         `UPDATE tarefas_operacao
