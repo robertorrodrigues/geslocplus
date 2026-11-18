@@ -2,7 +2,8 @@ export type AppUser = {
   id: string
   fullName: string
   email: string
-  role: "administrator" | "platform_admin"
+  role: "administrator" | "platform_admin" | "provider"
+  mustChangePassword: boolean
 }
 
 export class ApiError extends Error {

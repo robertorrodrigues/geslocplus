@@ -90,6 +90,8 @@ type AuthClaims = {
   fullName: string
 
   personType: string
+
+  mustChangePassword: boolean
 }
 
 declare global {
@@ -127,6 +129,7 @@ const readClaims = (token: string): AuthClaims => {
     userId: payload.userId,
     fullName: payload.fullName,
     personType: payload.personType,
+    mustChangePassword: payload.mustChangePassword === true,
   }
 }
 
@@ -177,6 +180,11 @@ const proprietarioAdminRequired = (
   _res: Response,
   next: NextFunction,
 ) => {
+  if (req.user?.mustChangePassword) {
+    return next(
+      new ApiError(403, "Altere sua senha para continuar usando a plataforma."),
+    )
+  }
   if (req.user?.personType !== "proprietario_adm") {
     return next(
       new ApiError(
@@ -193,10 +201,31 @@ const platformAdminRequired = (
   _res: Response,
   next: NextFunction,
 ) => {
+  if (req.user?.mustChangePassword) {
+    return next(
+      new ApiError(403, "Altere sua senha para continuar usando a plataforma."),
+    )
+  }
   if (req.user?.personType !== "admin_plataforma") {
     return next(
       new ApiError(403, "Acesso restrito ao administrador da plataforma."),
     )
+  }
+  next()
+}
+
+const providerRequired = (
+  req: Request,
+  _res: Response,
+  next: NextFunction,
+) => {
+  if (req.user?.mustChangePassword) {
+    return next(
+      new ApiError(403, "Altere sua senha para continuar usando a plataforma."),
+    )
+  }
+  if (req.user?.personType !== "prestador_servico") {
+    return next(new ApiError(403, "Acesso restrito a prestadores de serviços."))
   }
   next()
 }
@@ -218,6 +247,10 @@ const signupSchema = z.object({
   email: emailSchema,
   password: z.string().min(12).max(128),
   plan: z.enum(["mensal", "semestral", "anual"]).default("mensal"),
+})
+
+const changePasswordSchema = z.object({
+  newPassword: z.string().min(12).max(128),
 })
 
 const platformAdministratorSchema = z.object({
@@ -351,6 +384,10 @@ const operationTaskStatusSchema = z.object({
     "final_prb",
     "cancelada",
   ]),
+})
+
+const providerObservationSchema = z.object({
+  observation: z.string().trim().max(5000),
 })
 
 async function requireTaskExecutor(
@@ -536,8 +573,15 @@ app.post(
     }
 
     const result = await pool.query(
-      `SELECT id, nome, email, password_hash, tipo_pessoa
-       FROM usuarios WHERE lower(email) = lower($1) LIMIT 1`,
+      `SELECT u.id, u.nome, u.email, u.password_hash, u.tipo_pessoa,
+              u.must_change_password,
+              CASE WHEN u.tipo_pessoa = 'prestador_servico'
+                   THEN coalesce(ps.archived_at IS NOT NULL, true)
+                   ELSE false END AS provider_unavailable
+       FROM usuarios u
+       LEFT JOIN prestadores_servico ps
+         ON u.tipo_pessoa = 'prestador_servico' AND ps.id = u.pessoa_id
+       WHERE lower(u.email) = lower($1) LIMIT 1`,
 
       [parsed.data.email],
     )
@@ -552,8 +596,16 @@ app.post(
     }
 
     if (
+      user.tipo_pessoa === "prestador_servico" &&
+      user.provider_unavailable
+    ) {
+      throw new ApiError(403, "O cadastro deste prestador está arquivado.")
+    }
+
+    if (
       user.tipo_pessoa !== "proprietario_adm" &&
-      user.tipo_pessoa !== "admin_plataforma"
+      user.tipo_pessoa !== "admin_plataforma" &&
+      user.tipo_pessoa !== "prestador_servico"
     ) {
       throw new ApiError(
         403,
@@ -566,6 +618,7 @@ app.post(
         userId: String(user.id),
         fullName: user.nome,
         personType: user.tipo_pessoa,
+        mustChangePassword: user.must_change_password,
       },
 
       jwtSecret!,
@@ -593,7 +646,10 @@ app.post(
         role:
           user.tipo_pessoa === "admin_plataforma"
             ? "platform_admin"
-            : "administrator",
+            : user.tipo_pessoa === "prestador_servico"
+              ? "provider"
+              : "administrator",
+        mustChangePassword: user.must_change_password,
       },
     })
   }),
@@ -675,6 +731,7 @@ app.post(
           fullName: user.nome,
           email: user.email,
           role: "administrator",
+          mustChangePassword: false,
         },
         plan,
       })
@@ -693,6 +750,67 @@ app.post("/api/auth/logout", (_req, res) => {
   res.status(204).end()
 })
 
+app.post(
+  "/api/auth/change-password",
+  authRequired,
+  asyncRoute(async (req, res) => {
+    const parsed = changePasswordSchema.safeParse(req.body)
+    if (!parsed.success) {
+      throw new ApiError(400, "A nova senha deve ter entre 12 e 128 caracteres.")
+    }
+
+    const current = await pool.query(
+      "SELECT password_hash FROM usuarios WHERE id = $1",
+      [req.user!.userId],
+    )
+    if (!current.rowCount) throw new ApiError(401, "Usuário não encontrado.")
+    if (await bcrypt.compare(parsed.data.newPassword, current.rows[0].password_hash)) {
+      throw new ApiError(400, "Escolha uma senha diferente da senha atual.")
+    }
+
+    const passwordHash = await bcrypt.hash(parsed.data.newPassword, 12)
+    const updated = await pool.query(
+      `UPDATE usuarios
+       SET password_hash = $2, must_change_password = false, dt_alteracao = now()
+       WHERE id = $1
+       RETURNING id, nome, email, tipo_pessoa, must_change_password`,
+      [req.user!.userId, passwordHash],
+    )
+    const user = updated.rows[0]
+    const token = jwt.sign(
+      {
+        userId: String(user.id),
+        fullName: user.nome,
+        personType: user.tipo_pessoa,
+        mustChangePassword: false,
+      },
+      jwtSecret!,
+      { expiresIn: "12h" },
+    )
+    res.cookie(cookieName, token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      path: "/",
+      maxAge: sessionDurationMs,
+    })
+    res.json({
+      user: {
+        id: String(user.id),
+        fullName: user.nome,
+        email: user.email,
+        role:
+          user.tipo_pessoa === "admin_plataforma"
+            ? "platform_admin"
+            : user.tipo_pessoa === "prestador_servico"
+              ? "provider"
+              : "administrator",
+        mustChangePassword: user.must_change_password,
+      },
+    })
+  }),
+)
+
 app.get(
   "/api/auth/me",
 
@@ -706,7 +824,14 @@ app.get(
     }
 
     const result = await pool.query(
-      "SELECT id, nome, email, tipo_pessoa FROM usuarios WHERE id = $1",
+      `SELECT u.id, u.nome, u.email, u.tipo_pessoa, u.must_change_password,
+              CASE WHEN u.tipo_pessoa = 'prestador_servico'
+                   THEN coalesce(ps.archived_at IS NOT NULL, true)
+                   ELSE false END AS provider_unavailable
+       FROM usuarios u
+       LEFT JOIN prestadores_servico ps
+         ON u.tipo_pessoa = 'prestador_servico' AND ps.id = u.pessoa_id
+       WHERE u.id = $1`,
 
       [req.user.userId],
     )
@@ -716,6 +841,12 @@ app.get(
 
       res.json({ user: null })
 
+      return
+    }
+
+    if (result.rows[0].provider_unavailable) {
+      clearSessionCookie(res)
+      res.json({ user: null })
       return
     }
 
@@ -730,7 +861,10 @@ app.get(
         role:
           result.rows[0].tipo_pessoa === "admin_plataforma"
             ? "platform_admin"
-            : "administrator",
+            : result.rows[0].tipo_pessoa === "prestador_servico"
+              ? "provider"
+              : "administrator",
+        mustChangePassword: result.rows[0].must_change_password,
       },
     })
   }),
@@ -910,6 +1044,173 @@ app.post(
     } finally {
       client.release()
     }
+  }),
+)
+
+app.get(
+  "/api/provider/tasks",
+  authRequired,
+  providerRequired,
+  asyncRoute(async (req, res) => {
+    const result = await pool.query(
+      `SELECT t.id::text AS id, t.nome AS name, t.observacao AS observation,
+              t.observacao_prestador AS provider_observation,
+              im.nome AS property_name, t.dt_inicio AS start_at,
+              t.dt_fim AS end_at, t.status, t.provider_started,
+              coalesce((
+                SELECT json_agg(json_build_object(
+                  'id', tc.id::text,
+                  'title', tc.titulo,
+                  'items', coalesce((
+                    SELECT json_agg(json_build_object(
+                      'id', ci.id::text, 'title', ci.titulo,
+                      'description', ci.descricao, 'rule', ci.regra,
+                      'done', ci.concluido
+                    ) ORDER BY ci.posicao, ci.id)
+                    FROM tarefas_operacao_checklist_items ci
+                    WHERE ci.tarefa_checklist_id = tc.id
+                  ), '[]'::json)
+                ) ORDER BY tc.posicao, tc.id)
+                FROM tarefas_operacao_checklists tc
+                WHERE tc.tarefa_id = t.id
+              ), '[]'::json) AS checklists
+       FROM tarefas_operacao t
+       JOIN usuarios u
+         ON u.id = $1 AND u.tipo_pessoa = 'prestador_servico'
+       JOIN prestadores_servico ps
+         ON ps.id = u.pessoa_id AND ps.id = t.executor_prestador_id
+            AND ps.archived_at IS NULL
+       JOIN imoveis im ON im.id = t.imovel_id
+       WHERE t.executor_tipo = 'provider'
+       ORDER BY t.dt_inicio NULLS LAST, t.id DESC`,
+      [req.user!.userId],
+    )
+    res.json({ tasks: result.rows })
+  }),
+)
+
+app.patch(
+  "/api/provider/tasks/:id/status",
+  authRequired,
+  providerRequired,
+  asyncRoute(async (req, res) => {
+    const id = positiveId.safeParse(req.params.id)
+    const parsed = operationTaskStatusSchema.safeParse(req.body)
+    if (!id.success) throw new ApiError(400, "Identificador inválido.")
+    if (!parsed.success) throw new ApiError(400, "Status de tarefa inválido.")
+
+    const task = await pool.query(
+      `UPDATE tarefas_operacao t
+       SET status = $2,
+           provider_started = t.provider_started OR $2 <> 'iniciar'
+       WHERE t.id = $1 AND t.executor_tipo = 'provider'
+         AND EXISTS (
+           SELECT 1
+           FROM usuarios u
+           JOIN prestadores_servico ps
+             ON ps.id = u.pessoa_id AND ps.archived_at IS NULL
+           WHERE u.id = $3 AND u.tipo_pessoa = 'prestador_servico'
+             AND ps.id = t.executor_prestador_id
+         )
+       RETURNING t.id`,
+      [id.data, parsed.data.status, req.user!.userId],
+    )
+    if (!task.rowCount) throw new ApiError(404, "Tarefa não encontrada.")
+    res.status(204).end()
+  }),
+)
+
+app.patch(
+  "/api/provider/tasks/:id/observation",
+  authRequired,
+  providerRequired,
+  asyncRoute(async (req, res) => {
+    const id = positiveId.safeParse(req.params.id)
+    const parsed = providerObservationSchema.safeParse(req.body)
+    if (!id.success) throw new ApiError(400, "Identificador inválido.")
+    if (!parsed.success) {
+      throw new ApiError(400, "A observação deve ter no máximo 5.000 caracteres.")
+    }
+
+    const result = await pool.query(
+      `UPDATE tarefas_operacao t
+       SET observacao_prestador = $2
+       WHERE t.id = $1 AND t.executor_tipo = 'provider'
+         AND EXISTS (
+           SELECT 1
+           FROM usuarios u
+           JOIN prestadores_servico ps
+             ON ps.id = u.pessoa_id AND ps.archived_at IS NULL
+           WHERE u.id = $3 AND u.tipo_pessoa = 'prestador_servico'
+             AND ps.id = t.executor_prestador_id
+         )
+       RETURNING t.id`,
+      [id.data, parsed.data.observation, req.user!.userId],
+    )
+    if (!result.rowCount) throw new ApiError(404, "Tarefa não encontrada.")
+    res.status(204).end()
+  }),
+)
+
+app.patch(
+  "/api/provider/tasks/:taskId/checklist-items/:itemId",
+  authRequired,
+  providerRequired,
+  asyncRoute(async (req, res) => {
+    const taskId = positiveId.safeParse(req.params.taskId)
+    const itemId = positiveId.safeParse(req.params.itemId)
+    const parsed = z.object({ completed: z.boolean() }).safeParse(req.body)
+    if (!taskId.success || !itemId.success) {
+      throw new ApiError(400, "Identificador inválido.")
+    }
+    if (!parsed.success) throw new ApiError(400, "Estado do item inválido.")
+
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      const task = await client.query(
+        `SELECT t.id
+         FROM tarefas_operacao t
+         JOIN usuarios u
+           ON u.id = $2 AND u.tipo_pessoa = 'prestador_servico'
+         JOIN prestadores_servico ps
+           ON ps.id = u.pessoa_id AND ps.id = t.executor_prestador_id
+              AND ps.archived_at IS NULL
+         WHERE t.id = $1 AND t.executor_tipo = 'provider'
+         FOR UPDATE OF t`,
+        [taskId.data, req.user!.userId],
+      )
+      if (!task.rowCount) throw new ApiError(404, "Tarefa não encontrada.")
+
+      const item = await client.query(
+        `UPDATE tarefas_operacao_checklist_items ci
+         SET concluido = $3
+         WHERE ci.id = $1
+           AND EXISTS (
+             SELECT 1 FROM tarefas_operacao_checklists tc
+             WHERE tc.id = ci.tarefa_checklist_id AND tc.tarefa_id = $2
+           )
+         RETURNING ci.id`,
+        [itemId.data, taskId.data, parsed.data.completed],
+      )
+      if (!item.rowCount) {
+        throw new ApiError(404, "Item de checklist não encontrado.")
+      }
+
+      await client.query(
+        `UPDATE tarefas_operacao
+         SET status = 'em_andamento', provider_started = TRUE
+         WHERE id = $1`,
+        [taskId.data],
+      )
+      await client.query("COMMIT")
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
+    res.status(204).end()
   }),
 )
 
@@ -1479,17 +1780,22 @@ app.get(
       `SELECT 'proprietario_adm:' || id::text AS id, nome AS full_name,
               'administrator'::text AS kind, email, telefone AS phone,
               cpf_cnpj, NULL::text AS pix_code,
-              archived_at IS NOT NULL AS is_archived
+              archived_at IS NOT NULL AS is_archived, FALSE AS has_platform_user
        FROM proprietarios_adm
        WHERE created_by_user_id = $1
        UNION ALL
        SELECT 'preposto:' || id::text, nome, 'proxy'::text, email,
-              telefone, cpf_cnpj, NULL::text, archived_at IS NOT NULL
+              telefone, cpf_cnpj, NULL::text, archived_at IS NOT NULL, FALSE
        FROM prepostos
        WHERE created_by_user_id = $1
        UNION ALL
        SELECT 'prestador_servico:' || id::text, nome, 'provider'::text, email,
-              telefone, cpf_cnpj, codigo_pix, archived_at IS NOT NULL
+              telefone, cpf_cnpj, codigo_pix, archived_at IS NOT NULL,
+              EXISTS (
+                SELECT 1 FROM usuarios u
+                WHERE u.pessoa_id = prestadores_servico.id
+                  AND u.tipo_pessoa = 'prestador_servico'
+              ) AS has_platform_user
        FROM prestadores_servico
        WHERE created_by_user_id = $1
        ORDER BY full_name`,
@@ -1497,6 +1803,89 @@ app.get(
     )
 
     res.json({ people: result.rows })
+  }),
+)
+
+app.post(
+  "/api/people/:id/activate-user",
+  asyncRoute(async (req, res) => {
+    const rawId = req.params.id
+    const match =
+      typeof rawId === "string"
+        ? /^prestador_servico:([1-9]\d*)$/.exec(rawId)
+        : null
+    if (!match) throw new ApiError(400, "Identificador de prestador inválido.")
+
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+
+      const provider = await client.query(
+        `SELECT id, nome, email
+         FROM prestadores_servico
+         WHERE id = $1 AND created_by_user_id = $2 AND archived_at IS NULL
+         FOR UPDATE`,
+        [match[1], req.user!.userId],
+      )
+      if (!provider.rowCount) {
+        throw new ApiError(404, "Prestador não encontrado ou arquivado.")
+      }
+
+      const existingAccount = await client.query(
+        `SELECT 1 FROM usuarios
+         WHERE pessoa_id = $1 AND tipo_pessoa = 'prestador_servico'
+         LIMIT 1`,
+        [provider.rows[0].id],
+      )
+      if (existingAccount.rowCount) {
+        throw new ApiError(409, "Este prestador já possui usuário ativo.")
+      }
+
+      const emailResult = emailSchema.safeParse(provider.rows[0].email)
+      if (!emailResult.success) {
+        throw new ApiError(
+          400,
+          "Cadastre um e-mail válido para o prestador antes de ativar o usuário.",
+        )
+      }
+      const email = emailResult.data.toLowerCase()
+
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [email])
+      const emailInUse = await client.query(
+        "SELECT 1 FROM usuarios WHERE lower(email) = $1 LIMIT 1",
+        [email],
+      )
+      if (emailInUse.rowCount) {
+        throw new ApiError(
+          409,
+          "Este e-mail já está vinculado a outro usuário da plataforma.",
+        )
+      }
+
+      const temporaryPassword = "123456789012"
+      const passwordHash = await bcrypt.hash(temporaryPassword, 12)
+      await client.query(
+        `INSERT INTO usuarios (
+           nome, email, password_hash, pessoa_id, tipo_pessoa,
+           must_change_password
+         )
+         VALUES ($1, $2, $3, $4, 'prestador_servico', TRUE)`,
+        [provider.rows[0].nome, email, passwordHash, provider.rows[0].id],
+      )
+
+      await client.query("COMMIT")
+      res.status(201).json({
+        fullName: provider.rows[0].nome,
+        email,
+        temporaryPassword,
+        mustChangePassword: true,
+      })
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
   }),
 )
 
@@ -1652,8 +2041,10 @@ app.get(
   asyncRoute(async (req, res) => {
     const result = await pool.query(
       `SELECT t.id::text AS id, t.nome AS name, t.observacao AS observation,
+              t.observacao_prestador AS provider_observation,
               t.imovel_id::text AS property_id, im.nome AS property_name,
               t.dt_inicio AS start_at, t.dt_fim AS end_at, t.status,
+              t.provider_started,
               t.executor_tipo AS executor_type,
               coalesce(pa.id, ps.id)::text AS executor_id,
               coalesce(pa.nome, ps.nome) AS executor_name,
@@ -1772,7 +2163,8 @@ app.patch(
     try {
       await client.query("BEGIN")
       const currentTask = await client.query(
-        `SELECT id, executor_tipo, executor_administrador_id::text AS administrator_id,
+        `SELECT id, provider_started, status, executor_tipo,
+                executor_administrador_id::text AS administrator_id,
                 executor_prestador_id::text AS provider_id
          FROM tarefas_operacao
          WHERE id = $1 AND created_by_user_id = $2
@@ -1781,6 +2173,15 @@ app.patch(
       )
       if (!currentTask.rowCount) throw new ApiError(404, "Tarefa não encontrada.")
       const currentExecutor = currentTask.rows[0]
+      if (
+        currentExecutor.provider_started ||
+        currentExecutor.status !== "iniciar"
+      ) {
+        throw new ApiError(
+          409,
+          "Tarefas com status diferente de Iniciar não podem mais ser editadas pelo administrador.",
+        )
+      }
       const executorUnchanged =
         currentExecutor.executor_tipo === parsed.data.executorType &&
         (parsed.data.executorType === "administrator"
@@ -1847,21 +2248,42 @@ app.patch(
     if (!id.success) throw new ApiError(400, "Identificador inválido.")
     if (!parsed.success) throw new ApiError(400, "Status de tarefa inválido.")
 
-    const task = await pool.query(
-      `UPDATE tarefas_operacao t
-       SET status = $3
-       WHERE t.id = $1 AND t.created_by_user_id = $2
-         AND EXISTS (
-           SELECT 1 FROM proprietarios_adm_imoveis pai
-           JOIN usuarios u ON u.pessoa_id = pai.proprietarios_adm_id
-           WHERE pai.imoveis_id = t.imovel_id AND u.id = $2
-             AND u.tipo_pessoa = 'proprietario_adm'
-         )
-       RETURNING id`,
-      [id.data, req.user!.userId, parsed.data.status],
-    )
-    if (!task.rowCount) throw new ApiError(404, "Tarefa não encontrada.")
-    res.status(204).end()
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      const task = await client.query(
+        `SELECT t.id, t.provider_started, t.status
+         FROM tarefas_operacao t
+         WHERE t.id = $1 AND t.created_by_user_id = $2
+           AND EXISTS (
+             SELECT 1 FROM proprietarios_adm_imoveis pai
+             JOIN usuarios u ON u.pessoa_id = pai.proprietarios_adm_id
+             WHERE pai.imoveis_id = t.imovel_id AND u.id = $2
+               AND u.tipo_pessoa = 'proprietario_adm'
+           )
+         FOR UPDATE`,
+        [id.data, req.user!.userId],
+      )
+      if (!task.rowCount) throw new ApiError(404, "Tarefa não encontrada.")
+      if (task.rows[0].provider_started || task.rows[0].status !== "iniciar") {
+        throw new ApiError(
+          409,
+          "Tarefas com status diferente de Iniciar não podem mais ser alteradas pelo administrador.",
+        )
+      }
+
+      await client.query(
+        `UPDATE tarefas_operacao SET status = $2 WHERE id = $1`,
+        [id.data, parsed.data.status],
+      )
+      await client.query("COMMIT")
+      res.status(204).end()
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
   }),
 )
 
@@ -1876,25 +2298,43 @@ app.patch(
     }
     if (!parsed.success) throw new ApiError(400, "Estado do item inválido.")
 
-    const item = await pool.query(
-      `UPDATE tarefas_operacao_checklist_items ci
-       SET concluido = $3
-       WHERE ci.id = $1
-         AND EXISTS (
-           SELECT 1
-           FROM tarefas_operacao_checklists tc
-           JOIN tarefas_operacao t ON t.id = tc.tarefa_id
-           JOIN proprietarios_adm_imoveis pai ON pai.imoveis_id = t.imovel_id
-           JOIN usuarios u ON u.pessoa_id = pai.proprietarios_adm_id
-           WHERE tc.id = ci.tarefa_checklist_id
-             AND t.id = $2 AND t.created_by_user_id = $4
-             AND u.id = $4 AND u.tipo_pessoa = 'proprietario_adm'
-         )
-       RETURNING ci.id`,
-      [itemId.data, taskId.data, parsed.data.completed, req.user!.userId],
-    )
-    if (!item.rowCount) {
-      throw new ApiError(404, "Item de checklist não encontrado.")
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      const task = await client.query(
+        `SELECT t.id, t.provider_started, t.status
+         FROM tarefas_operacao t
+         JOIN tarefas_operacao_checklists tc ON tc.tarefa_id = t.id
+         JOIN tarefas_operacao_checklist_items ci
+           ON ci.tarefa_checklist_id = tc.id AND ci.id = $2
+         JOIN proprietarios_adm_imoveis pai ON pai.imoveis_id = t.imovel_id
+         JOIN usuarios u ON u.pessoa_id = pai.proprietarios_adm_id
+         WHERE t.id = $1 AND t.created_by_user_id = $3
+           AND u.id = $3 AND u.tipo_pessoa = 'proprietario_adm'
+         FOR UPDATE OF t`,
+        [taskId.data, itemId.data, req.user!.userId],
+      )
+      if (!task.rowCount) {
+        throw new ApiError(404, "Item de checklist não encontrado.")
+      }
+      if (task.rows[0].provider_started || task.rows[0].status !== "iniciar") {
+        throw new ApiError(
+          409,
+          "Tarefas com status diferente de Iniciar não podem mais ser alteradas pelo administrador.",
+        )
+      }
+
+      await client.query(
+        `UPDATE tarefas_operacao_checklist_items
+         SET concluido = $2 WHERE id = $1`,
+        [itemId.data, parsed.data.completed],
+      )
+      await client.query("COMMIT")
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
     }
     res.status(204).end()
   }),
@@ -1906,20 +2346,41 @@ app.delete(
     const id = positiveId.safeParse(req.params.id)
     if (!id.success) throw new ApiError(400, "Identificador inválido.")
 
-    const task = await pool.query(
-      `DELETE FROM tarefas_operacao t
-       WHERE t.id = $1 AND t.created_by_user_id = $2
-         AND EXISTS (
-           SELECT 1 FROM proprietarios_adm_imoveis pai
-           JOIN usuarios u ON u.pessoa_id = pai.proprietarios_adm_id
-           WHERE pai.imoveis_id = t.imovel_id AND u.id = $2
-             AND u.tipo_pessoa = 'proprietario_adm'
-         )
-       RETURNING id`,
-      [id.data, req.user!.userId],
-    )
-    if (!task.rowCount) throw new ApiError(404, "Tarefa não encontrada.")
-    res.status(204).end()
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      const task = await client.query(
+        `SELECT t.id, t.provider_started, t.status
+         FROM tarefas_operacao t
+         WHERE t.id = $1 AND t.created_by_user_id = $2
+           AND EXISTS (
+             SELECT 1 FROM proprietarios_adm_imoveis pai
+             JOIN usuarios u ON u.pessoa_id = pai.proprietarios_adm_id
+             WHERE pai.imoveis_id = t.imovel_id AND u.id = $2
+               AND u.tipo_pessoa = 'proprietario_adm'
+           )
+         FOR UPDATE`,
+        [id.data, req.user!.userId],
+      )
+      if (!task.rowCount) throw new ApiError(404, "Tarefa não encontrada.")
+      if (task.rows[0].provider_started || task.rows[0].status !== "iniciar") {
+        throw new ApiError(
+          409,
+          "Tarefas com status diferente de Iniciar não podem mais ser excluídas pelo administrador.",
+        )
+      }
+
+      await client.query("DELETE FROM tarefas_operacao WHERE id = $1", [
+        id.data,
+      ])
+      await client.query("COMMIT")
+      res.status(204).end()
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
   }),
 )
 

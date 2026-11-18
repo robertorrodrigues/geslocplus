@@ -8,6 +8,8 @@ import {
 import { api, ApiError, initials, type AppUser } from "./api"
 import Login from "./Login"
 import PlatformAdminHome from "./PlatformAdminHome"
+import PasswordChange from "./PasswordChange"
+import ProviderHome from "./ProviderHome"
 
 type IconName = "home" | "building" | "check" | "users" | "bell" | "chevron" | "arrow" | "calendar" | "clock" | "pin" | "more" | "plus" | "search" | "filter" | "bed" | "sparkle" | "tool" | "key" | "wallet" | "briefcase" | "close" | "userPlus" | "clipboard"
 
@@ -220,11 +222,13 @@ type OperationTask = {
   id: string
   name: string
   observation: string
+  provider_observation: string | null
   property_id: string
   property_name: string
   start_at: string | null
   end_at: string | null
   status: OperationTaskStatus
+  provider_started: boolean
   executor_type: "administrator" | "provider"
   executor_id: string
   executor_name: string
@@ -243,6 +247,7 @@ type Person = {
   color: string
   kind: "administrator" | "proxy" | "provider"
   isArchived: boolean
+  hasPlatformUser: boolean
 }
 
 type Dashboard = {
@@ -285,6 +290,7 @@ type PersonResponse = {
   cpf_cnpj: string | null
   pix_code: string | null
   is_archived: boolean
+  has_platform_user: boolean
 }
 
 type TaskResponse = {
@@ -431,6 +437,11 @@ export default function App() {
   const [notice, setNotice] = useState("")
   const [personFilter, setPersonFilter] = useState("Todos")
   const [operationFilter, setOperationFilter] = useState("Tarefas")
+  const [activationCredentials, setActivationCredentials] = useState<{
+    fullName: string
+    email: string
+    temporaryPassword: string
+  } | null>(null)
 
   useEffect(() => {
     api<{ user: AppUser | null }>("/auth/me")
@@ -515,6 +526,7 @@ export default function App() {
                   : "purple",
             kind: item.kind,
             isArchived: item.is_archived,
+            hasPlatformUser: item.has_platform_user,
           }
         }),
       )
@@ -752,6 +764,26 @@ export default function App() {
     }
   }
 
+  async function activateProviderAccount(person: Person) {
+    try {
+      const credentials = await api<{
+        fullName: string
+        email: string
+        temporaryPassword: string
+      }>(`/people/${encodeURIComponent(person.id)}/activate-user`, {
+        method: "POST",
+      })
+      setActivationCredentials(credentials)
+      await loadAppData()
+    } catch (error) {
+      flash(
+        error instanceof Error
+          ? error.message
+          : "Não foi possível ativar o usuário do prestador.",
+      )
+    }
+  }
+
   async function addChecklistTemplate(templateId: string) {
     await api(`/checklists/${encodeURIComponent(templateId)}/subscribe`, {
       method: "POST",
@@ -790,6 +822,7 @@ export default function App() {
       setChecklistTemplates([])
       setDashboard(emptyDashboard)
       setEditingPerson(null)
+      setActivationCredentials(null)
       setTaskEditorOpen(false)
       setEditingTask(null)
     } catch (error) {
@@ -831,8 +864,20 @@ export default function App() {
       />
     )
   }
+  if (user.mustChangePassword) {
+    return (
+      <PasswordChange
+        user={user}
+        onChanged={setUser}
+        onLogout={() => void logout()}
+      />
+    )
+  }
   if (user.role === "platform_admin") {
     return <PlatformAdminHome user={user} onLogout={() => void logout()} />
+  }
+  if (user.role === "provider") {
+    return <ProviderHome user={user} onLogout={() => void logout()} />
   }
 
   return (
@@ -942,6 +987,7 @@ export default function App() {
               }}
               onArchive={(person) => void setPersonArchived(person, true)}
               onReactivate={(person) => void setPersonArchived(person, false)}
+              onActivate={(person) => void activateProviderAccount(person)}
             />
           )}
         </div>
@@ -1011,6 +1057,12 @@ export default function App() {
               )
               setEquipmentProperty(null)
             }}
+          />
+        )}
+        {activationCredentials && (
+          <ProviderActivationModal
+            credentials={activationCredentials}
+            onClose={() => setActivationCredentials(null)}
           />
         )}
       </main>
@@ -1761,6 +1813,8 @@ function OperationTaskCard({
   const statusLabel =
     operationTaskStatuses.find((status) => status.value === task.status)?.label ??
     task.status
+  const administratorLocked =
+    task.provider_started || task.status !== "iniciar"
   const checklistItemCount = task.checklists.reduce(
     (total, checklist) => total + checklist.items.length,
     0,
@@ -1781,14 +1835,16 @@ function OperationTaskCard({
           <button
             type="button"
             onClick={onEdit}
-            className="rounded-full border border-[#dfe2db] px-3 py-1.5 text-[10px] font-extrabold text-[#34705d]"
+            disabled={administratorLocked}
+            className="rounded-full border border-[#dfe2db] px-3 py-1.5 text-[10px] font-extrabold text-[#34705d] disabled:cursor-not-allowed disabled:bg-[#f0eee7] disabled:text-[#827b70]"
           >
             Editar
           </button>
           <button
             type="button"
             onClick={() => void remove()}
-            className="rounded-full border border-[#f0d7d0] px-3 py-1.5 text-[10px] font-extrabold text-[#a84734]"
+            disabled={administratorLocked}
+            className="rounded-full border border-[#f0d7d0] px-3 py-1.5 text-[10px] font-extrabold text-[#a84734] disabled:cursor-not-allowed disabled:bg-[#f0eee7] disabled:text-[#827b70]"
           >
             Excluir
           </button>
@@ -1808,17 +1864,31 @@ function OperationTaskCard({
           {task.observation}
         </p>
       )}
+      {task.provider_observation && (
+        <p className="mt-3 whitespace-pre-wrap rounded-xl bg-[#f7f8f4] p-3 text-xs leading-5 text-[#596761]">
+          <span className="mb-1 block text-[10px] font-extrabold uppercase tracking-wide text-[#34705d]">
+            Observação do prestador
+          </span>
+          {task.provider_observation}
+        </p>
+      )}
+      {administratorLocked && (
+        <p className="mt-3 rounded-xl bg-[#fff4e8] px-3 py-2 text-[10px] font-extrabold text-[#9b612b]">
+          Tarefa iniciada. Edição e alterações administrativas estão bloqueadas.
+        </p>
+      )}
       <label className="mt-4 block">
         <span className="field-label">Status · {statusLabel}</span>
         <select
           value={task.status}
+          disabled={administratorLocked}
           onChange={(event) => {
             const nextStatus = operationTaskStatuses.find(
               (status) => status.value === event.currentTarget.value,
             )?.value
             if (nextStatus) onStatus(task.id, nextStatus)
           }}
-          className="w-full rounded-2xl border border-[#dfded7] bg-white px-4 py-3 text-xs font-bold outline-none focus:border-[#34705d]"
+          className="w-full rounded-2xl border border-[#dfded7] bg-white px-4 py-3 text-xs font-bold outline-none focus:border-[#34705d] disabled:cursor-not-allowed disabled:bg-[#f0eee7] disabled:text-[#827b70]"
         >
           {operationTaskStatuses.map((status) => (
             <option key={status.value} value={status.value}>
@@ -1844,10 +1914,11 @@ function OperationTaskCard({
                       <input
                         type="checkbox"
                         checked={item.done}
+                        disabled={administratorLocked}
                         onChange={(event) =>
                           void toggleItem(item.id, event.currentTarget.checked)
                         }
-                        className="mt-0.5 accent-[#34705d]"
+                        className="mt-0.5 accent-[#34705d] disabled:cursor-not-allowed"
                       />
                       <span className={item.done ? "line-through opacity-60" : ""}>
                         {item.title}
@@ -2477,6 +2548,69 @@ function PersonalChecklistCard({
   )
 }
 
+function ProviderActivationModal({
+  credentials,
+  onClose,
+}: {
+  credentials: {
+    fullName: string
+    email: string
+    temporaryPassword: string
+  }
+  onClose: () => void
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-[100] flex items-center justify-center bg-[#172321]/55 p-5"
+      role="presentation"
+    >
+      <section
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="provider-activation-title"
+        className="w-full max-w-[420px] rounded-[26px] bg-white p-6 shadow-2xl"
+      >
+        <p className="text-xs font-extrabold uppercase tracking-[.15em] text-[#34705d]">
+          Usuário ativado
+        </p>
+        <h2
+          id="provider-activation-title"
+          className="mt-2 text-xl font-extrabold"
+        >
+          Dados de acesso de {credentials.fullName}
+        </h2>
+        <p className="mt-2 text-sm leading-relaxed text-[#68736d]">
+          Compartilhe estes dados com o prestador. A senha deverá ser alterada
+          no primeiro acesso.
+        </p>
+        <label className="mt-5 block text-xs font-extrabold text-[#59645f]">
+          E-mail de acesso
+          <input
+            readOnly
+            value={credentials.email}
+            className="mt-2 w-full select-all rounded-xl border border-[#dfe2db] bg-[#f8f7f2] px-3 py-3 text-sm font-bold text-[#172321]"
+          />
+        </label>
+        <label className="mt-4 block text-xs font-extrabold text-[#59645f]">
+          Senha temporária
+          <input
+            readOnly
+            value={credentials.temporaryPassword}
+            className="mt-2 w-full select-all rounded-xl border border-[#dfe2db] bg-[#f8f7f2] px-3 py-3 text-sm font-bold text-[#172321]"
+          />
+        </label>
+        <button
+          type="button"
+          onClick={onClose}
+          className="mt-6 w-full rounded-xl bg-[#173e37] px-4 py-3 text-sm font-extrabold text-white"
+        >
+          Entendi
+        </button>
+      </section>
+    </div>
+  )
+}
+
 function PeopleScreen({
   filter,
   setFilter,
@@ -2485,6 +2619,7 @@ function PeopleScreen({
   onEdit,
   onArchive,
   onReactivate,
+  onActivate,
 }: {
   filter: string
   setFilter: (value: string) => void
@@ -2493,6 +2628,7 @@ function PeopleScreen({
   onEdit: (person: Person) => void
   onArchive: (person: Person) => void
   onReactivate: (person: Person) => void
+  onActivate: (person: Person) => void
 }) {
   const [showArchived, setShowArchived] = useState(false)
   const filtered = people.filter((person) => {
@@ -2562,6 +2698,7 @@ function PeopleScreen({
               onEdit={() => onEdit(person)}
               onArchive={() => onArchive(person)}
               onReactivate={() => onReactivate(person)}
+              onActivate={() => onActivate(person)}
             />
           ))}
           {!filtered.length && (
@@ -2581,12 +2718,14 @@ function PersonRow({
   onEdit,
   onArchive,
   onReactivate,
+  onActivate,
 }: {
   person: Person
   last: boolean
   onEdit: () => void
   onArchive: () => void
   onReactivate: () => void
+  onActivate: () => void
 }) {
   const colors: Record<string, string> = {
     coral: "bg-[#f9d8d0] text-[#b8523e]",
@@ -2633,6 +2772,16 @@ function PersonRow({
         </div>
       </div>
       <div className="mt-3 flex justify-end gap-2">
+        {person.kind === "provider" && !person.isArchived && (
+          <button
+            type="button"
+            onClick={onActivate}
+            disabled={person.hasPlatformUser}
+            className="rounded-xl bg-[#e7f0eb] px-3 py-2 text-[10px] font-extrabold text-[#34705d] disabled:cursor-not-allowed disabled:bg-[#f0eee7] disabled:text-[#827b70]"
+          >
+            {person.hasPlatformUser ? "Usu Ativo" : "Ativar Usu"}
+          </button>
+        )}
         <button
           type="button"
           onClick={onEdit}
