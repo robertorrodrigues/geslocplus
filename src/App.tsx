@@ -10,6 +10,7 @@ import Login from "./Login"
 import PlatformAdminHome from "./PlatformAdminHome"
 import PasswordChange from "./PasswordChange"
 import ProviderHome from "./ProviderHome"
+import TaskMessages from "./TaskMessages"
 
 type IconName = "home" | "building" | "check" | "users" | "bell" | "chevron" | "arrow" | "calendar" | "clock" | "pin" | "more" | "plus" | "search" | "filter" | "bed" | "sparkle" | "tool" | "key" | "wallet" | "briefcase" | "close" | "userPlus" | "clipboard"
 
@@ -218,6 +219,11 @@ type OperationChecklist = {
   items: OperationChecklistItem[]
 }
 
+type OperationTaskImage = {
+  id: string
+  created_at: string
+}
+
 type OperationTask = {
   id: string
   name: string
@@ -233,6 +239,7 @@ type OperationTask = {
   executor_id: string
   executor_name: string
   checklists: OperationChecklist[]
+  images: OperationTaskImage[]
 }
 
 type Person = {
@@ -1864,13 +1871,37 @@ function OperationTaskCard({
           {task.observation}
         </p>
       )}
-      {task.provider_observation && (
-        <p className="mt-3 whitespace-pre-wrap rounded-xl bg-[#f7f8f4] p-3 text-xs leading-5 text-[#596761]">
-          <span className="mb-1 block text-[10px] font-extrabold uppercase tracking-wide text-[#34705d]">
-            Observação do prestador
-          </span>
-          {task.provider_observation}
-        </p>
+      {task.executor_type === "provider" && task.status !== "iniciar" && (
+        <TaskMessages
+          taskId={task.id}
+          endpoint="/operation/tasks"
+          legacyObservation={task.provider_observation}
+        />
+      )}
+      {!!task.images.length && (
+        <div className="mt-4">
+          <p className="mb-2 text-[10px] font-extrabold uppercase tracking-wide text-[#34705d]">
+            Imagens de evidência ({task.images.length})
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {task.images.map((image) => (
+              <a
+                key={image.id}
+                href={`/api/operation/tasks/${encodeURIComponent(task.id)}/images/${encodeURIComponent(image.id)}`}
+                target="_blank"
+                rel="noreferrer"
+                className="block h-20 w-20 overflow-hidden rounded-xl border border-[#dfe2db]"
+              >
+                <img
+                  src={`/api/operation/tasks/${encodeURIComponent(task.id)}/images/${encodeURIComponent(image.id)}`}
+                  alt="Evidência enviada pelo prestador"
+                  loading="lazy"
+                  className="h-full w-full object-cover"
+                />
+              </a>
+            ))}
+          </div>
+        </div>
       )}
       {administratorLocked && (
         <p className="mt-3 rounded-xl bg-[#fff4e8] px-3 py-2 text-[10px] font-extrabold text-[#9b612b]">

@@ -78,6 +78,8 @@ const equipmentPhotoSchema = z.object({
   imageDataUrl: z.string().max(7_000_000),
 })
 
+const taskImageSchema = equipmentPhotoSchema
+
 const app = express()
 
 const cookieName = "geslocplus_session"
@@ -233,6 +235,7 @@ const providerRequired = (
 const positiveId = z.string().regex(/^[1-9]\d*$/, "Identificador inválido.")
 const maxImageBytes = 5 * 1024 * 1024
 const maxEquipmentPhotos = 10
+const maxTaskImages = 10
 
 const emailSchema = z.string().trim().email().max(254)
 
@@ -388,6 +391,10 @@ const operationTaskStatusSchema = z.object({
 
 const providerObservationSchema = z.object({
   observation: z.string().trim().max(5000),
+})
+
+const taskMessageSchema = z.object({
+  message: z.string().trim().min(1).max(5000),
 })
 
 async function requireTaskExecutor(
@@ -1073,7 +1080,14 @@ app.get(
                 ) ORDER BY tc.posicao, tc.id)
                 FROM tarefas_operacao_checklists tc
                 WHERE tc.tarefa_id = t.id
-              ), '[]'::json) AS checklists
+              ), '[]'::json) AS checklists,
+              coalesce((
+                SELECT json_agg(json_build_object(
+                  'id', image.id::text, 'created_at', image.created_at
+                ) ORDER BY image.created_at DESC, image.id DESC)
+                FROM tarefas_operacao_imagens image
+                WHERE image.tarefa_id = t.id
+              ), '[]'::json) AS images
        FROM tarefas_operacao t
        JOIN usuarios u
          ON u.id = $1 AND u.tipo_pessoa = 'prestador_servico'
@@ -1120,6 +1134,96 @@ app.patch(
   }),
 )
 
+app.post(
+  "/api/provider/tasks/:id/messages",
+  authRequired,
+  providerRequired,
+  asyncRoute(async (req, res) => {
+    const id = positiveId.safeParse(req.params.id)
+    const parsed = taskMessageSchema.safeParse(req.body)
+    if (!id.success) throw new ApiError(400, "Identificador inválido.")
+    if (!parsed.success) {
+      throw new ApiError(400, "Escreva uma mensagem de até 5.000 caracteres.")
+    }
+
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      const task = await client.query(
+        `SELECT t.id, t.status
+         FROM tarefas_operacao t
+         JOIN usuarios u
+           ON u.id = $2 AND u.tipo_pessoa = 'prestador_servico'
+         JOIN prestadores_servico ps
+           ON ps.id = u.pessoa_id AND ps.id = t.executor_prestador_id
+              AND ps.archived_at IS NULL
+         WHERE t.id = $1 AND t.executor_tipo = 'provider'
+         FOR UPDATE OF t`,
+        [id.data, req.user!.userId],
+      )
+      if (!task.rowCount) throw new ApiError(404, "Tarefa não encontrada.")
+      if (task.rows[0].status === "iniciar") {
+        throw new ApiError(
+          409,
+          "As mensagens ficam disponíveis após o início da tarefa.",
+        )
+      }
+
+      const saved = await client.query(
+        `INSERT INTO tarefas_operacao_mensagens (
+           tarefa_id, sender_user_id, sender_name, sender_type, mensagem
+         )
+         SELECT $1, u.id, u.nome, u.tipo_pessoa, $3
+         FROM usuarios u
+         WHERE u.id = $2 AND u.tipo_pessoa = 'prestador_servico'
+         RETURNING id::text AS id, mensagem AS message, sender_name,
+                   sender_type, created_at`,
+        [id.data, req.user!.userId, parsed.data.message],
+      )
+      if (!saved.rowCount) throw new ApiError(401, "Usuário não encontrado.")
+      await client.query("COMMIT")
+      res.status(201).json({ message: saved.rows[0] })
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
+  }),
+)
+
+app.get(
+  "/api/provider/tasks/:id/messages",
+  authRequired,
+  providerRequired,
+  asyncRoute(async (req, res) => {
+    const id = positiveId.safeParse(req.params.id)
+    if (!id.success) throw new ApiError(400, "Identificador inválido.")
+    const task = await pool.query(
+      `SELECT t.id
+       FROM tarefas_operacao t
+       JOIN usuarios u
+         ON u.id = $2 AND u.tipo_pessoa = 'prestador_servico'
+       JOIN prestadores_servico ps
+         ON ps.id = u.pessoa_id AND ps.id = t.executor_prestador_id
+            AND ps.archived_at IS NULL
+       WHERE t.id = $1 AND t.executor_tipo = 'provider'
+         AND t.status <> 'iniciar'`,
+      [id.data, req.user!.userId],
+    )
+    if (!task.rowCount) throw new ApiError(404, "Tarefa não encontrada.")
+    const messages = await pool.query(
+      `SELECT id::text AS id, mensagem AS message, sender_name, sender_type,
+              created_at
+       FROM tarefas_operacao_mensagens
+       WHERE tarefa_id = $1
+       ORDER BY created_at, id`,
+      [id.data],
+    )
+    res.json({ messages: messages.rows })
+  }),
+)
+
 app.patch(
   "/api/provider/tasks/:id/observation",
   authRequired,
@@ -1132,23 +1236,143 @@ app.patch(
       throw new ApiError(400, "A observação deve ter no máximo 5.000 caracteres.")
     }
 
-    const result = await pool.query(
-      `UPDATE tarefas_operacao t
-       SET observacao_prestador = $2
-       WHERE t.id = $1 AND t.executor_tipo = 'provider'
-         AND EXISTS (
-           SELECT 1
-           FROM usuarios u
-           JOIN prestadores_servico ps
-             ON ps.id = u.pessoa_id AND ps.archived_at IS NULL
-           WHERE u.id = $3 AND u.tipo_pessoa = 'prestador_servico'
-             AND ps.id = t.executor_prestador_id
-         )
-       RETURNING t.id`,
-      [id.data, parsed.data.observation, req.user!.userId],
-    )
-    if (!result.rowCount) throw new ApiError(404, "Tarefa não encontrada.")
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      const task = await client.query(
+        `SELECT t.id, t.status
+         FROM tarefas_operacao t
+         JOIN usuarios u
+           ON u.id = $2 AND u.tipo_pessoa = 'prestador_servico'
+         JOIN prestadores_servico ps
+           ON ps.id = u.pessoa_id AND ps.id = t.executor_prestador_id
+              AND ps.archived_at IS NULL
+         WHERE t.id = $1 AND t.executor_tipo = 'provider'
+         FOR UPDATE OF t`,
+        [id.data, req.user!.userId],
+      )
+      if (!task.rowCount) throw new ApiError(404, "Tarefa não encontrada.")
+      if (task.rows[0].status === "iniciar") {
+        throw new ApiError(
+          409,
+          "A observação compartilhada fica disponível após o início da tarefa.",
+        )
+      }
+
+      await client.query(
+        `UPDATE tarefas_operacao
+         SET observacao_prestador = $2
+         WHERE id = $1`,
+        [id.data, parsed.data.observation],
+      )
+      await client.query("COMMIT")
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
     res.status(204).end()
+  }),
+)
+
+app.post(
+  "/api/provider/tasks/:taskId/images",
+  authRequired,
+  providerRequired,
+  asyncRoute(async (req, res) => {
+    const taskId = positiveId.safeParse(req.params.taskId)
+    if (!taskId.success) throw new ApiError(400, "Identificador inválido.")
+    const parsed = taskImageSchema.safeParse(req.body)
+    if (!parsed.success) throw new ApiError(400, "Envie uma imagem válida.")
+    const image = parseImageDataUrl(parsed.data.imageDataUrl)
+    if (!image) throw new ApiError(400, "Selecione uma imagem para enviar.")
+
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      const task = await client.query(
+        `SELECT t.id, t.status
+         FROM tarefas_operacao t
+         JOIN usuarios u
+           ON u.id = $2 AND u.tipo_pessoa = 'prestador_servico'
+         JOIN prestadores_servico ps
+           ON ps.id = u.pessoa_id AND ps.id = t.executor_prestador_id
+              AND ps.archived_at IS NULL
+         WHERE t.id = $1 AND t.executor_tipo = 'provider'
+         FOR UPDATE OF t`,
+        [taskId.data, req.user!.userId],
+      )
+      if (!task.rowCount) throw new ApiError(404, "Tarefa não encontrada.")
+      if (task.rows[0].status === "iniciar") {
+        throw new ApiError(
+          409,
+          "As imagens ficam disponíveis após o início da tarefa.",
+        )
+      }
+
+      const count = await client.query(
+        `SELECT count(*)::int AS total
+         FROM tarefas_operacao_imagens WHERE tarefa_id = $1`,
+        [taskId.data],
+      )
+      if (count.rows[0].total >= maxTaskImages) {
+        throw new ApiError(
+          400,
+          `Cada tarefa pode ter até ${maxTaskImages} imagens.`,
+        )
+      }
+
+      const saved = await client.query(
+        `INSERT INTO tarefas_operacao_imagens
+           (tarefa_id, uploaded_by_user_id, image_data, image_mime_type)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id::text AS id, created_at`,
+        [taskId.data, req.user!.userId, image.data, image.mimeType],
+      )
+      await client.query("COMMIT")
+      res.status(201).json({ image: saved.rows[0] })
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
+  }),
+)
+
+app.get(
+  "/api/provider/tasks/:taskId/images/:imageId",
+  authRequired,
+  providerRequired,
+  asyncRoute(async (req, res) => {
+    const taskId = positiveId.safeParse(req.params.taskId)
+    const imageId = positiveId.safeParse(req.params.imageId)
+    if (!taskId.success || !imageId.success) {
+      throw new ApiError(400, "Identificador inválido.")
+    }
+    const result = await pool.query(
+      `SELECT image.image_data, image.image_mime_type
+       FROM tarefas_operacao_imagens image
+       JOIN tarefas_operacao t ON t.id = image.tarefa_id
+       JOIN usuarios u
+         ON u.id = $3 AND u.tipo_pessoa = 'prestador_servico'
+       JOIN prestadores_servico ps
+         ON ps.id = u.pessoa_id AND ps.id = t.executor_prestador_id
+            AND ps.archived_at IS NULL
+       WHERE t.id = $1 AND image.id = $2 AND t.executor_tipo = 'provider'`,
+      [taskId.data, imageId.data, req.user!.userId],
+    )
+    const image = result.rows[0]
+    if (
+      !image?.image_data ||
+      !["image/jpeg", "image/png", "image/webp"].includes(image.image_mime_type)
+    ) {
+      throw new ApiError(404, "Imagem não encontrada.")
+    }
+    res.setHeader("Cache-Control", "private, no-store")
+    res.setHeader("X-Content-Type-Options", "nosniff")
+    res.type(image.image_mime_type).send(image.image_data)
   }),
 )
 
@@ -2065,7 +2289,14 @@ app.get(
                 ) ORDER BY tc.posicao, tc.id)
                 FROM tarefas_operacao_checklists tc
                 WHERE tc.tarefa_id = t.id
-              ), '[]'::json) AS checklists
+              ), '[]'::json) AS checklists,
+              coalesce((
+                SELECT json_agg(json_build_object(
+                  'id', image.id::text, 'created_at', image.created_at
+                ) ORDER BY image.created_at DESC, image.id DESC)
+                FROM tarefas_operacao_imagens image
+                WHERE image.tarefa_id = t.id
+              ), '[]'::json) AS images
        FROM tarefas_operacao t
        JOIN imoveis im ON im.id = t.imovel_id
        LEFT JOIN proprietarios_adm pa
@@ -2083,6 +2314,95 @@ app.get(
       [req.user!.userId],
     )
     res.json({ tasks: result.rows })
+  }),
+)
+
+app.get(
+  "/api/operation/tasks/:id/messages",
+  asyncRoute(async (req, res) => {
+    const id = positiveId.safeParse(req.params.id)
+    if (!id.success) throw new ApiError(400, "Identificador inválido.")
+    const task = await pool.query(
+      `SELECT t.id
+       FROM tarefas_operacao t
+       WHERE t.id = $1 AND t.created_by_user_id = $2
+         AND t.executor_tipo = 'provider' AND t.status <> 'iniciar'
+         AND EXISTS (
+           SELECT 1 FROM proprietarios_adm_imoveis pai
+           JOIN usuarios u ON u.pessoa_id = pai.proprietarios_adm_id
+           WHERE pai.imoveis_id = t.imovel_id AND u.id = $2
+             AND u.tipo_pessoa = 'proprietario_adm'
+         )`,
+      [id.data, req.user!.userId],
+    )
+    if (!task.rowCount) throw new ApiError(404, "Tarefa não encontrada.")
+    const messages = await pool.query(
+      `SELECT id::text AS id, mensagem AS message, sender_name, sender_type,
+              created_at
+       FROM tarefas_operacao_mensagens
+       WHERE tarefa_id = $1
+       ORDER BY created_at, id`,
+      [id.data],
+    )
+    res.json({ messages: messages.rows })
+  }),
+)
+
+app.post(
+  "/api/operation/tasks/:id/messages",
+  asyncRoute(async (req, res) => {
+    const id = positiveId.safeParse(req.params.id)
+    const parsed = taskMessageSchema.safeParse(req.body)
+    if (!id.success) throw new ApiError(400, "Identificador inválido.")
+    if (!parsed.success) {
+      throw new ApiError(400, "Escreva uma mensagem de até 5.000 caracteres.")
+    }
+
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      const task = await client.query(
+        `SELECT t.id, t.status
+         FROM tarefas_operacao t
+         WHERE t.id = $1 AND t.created_by_user_id = $2
+           AND t.executor_tipo = 'provider'
+           AND EXISTS (
+             SELECT 1 FROM proprietarios_adm_imoveis pai
+             JOIN usuarios u ON u.pessoa_id = pai.proprietarios_adm_id
+             WHERE pai.imoveis_id = t.imovel_id AND u.id = $2
+               AND u.tipo_pessoa = 'proprietario_adm'
+           )
+         FOR UPDATE`,
+        [id.data, req.user!.userId],
+      )
+      if (!task.rowCount) throw new ApiError(404, "Tarefa não encontrada.")
+      if (task.rows[0].status === "iniciar") {
+        throw new ApiError(
+          409,
+          "As mensagens ficam disponíveis após o início da tarefa.",
+        )
+      }
+
+      const saved = await client.query(
+        `INSERT INTO tarefas_operacao_mensagens (
+           tarefa_id, sender_user_id, sender_name, sender_type, mensagem
+         )
+         SELECT $1, u.id, u.nome, u.tipo_pessoa, $3
+         FROM usuarios u
+         WHERE u.id = $2 AND u.tipo_pessoa = 'proprietario_adm'
+         RETURNING id::text AS id, mensagem AS message, sender_name,
+                   sender_type, created_at`,
+        [id.data, req.user!.userId, parsed.data.message],
+      )
+      if (!saved.rowCount) throw new ApiError(401, "Usuário não encontrado.")
+      await client.query("COMMIT")
+      res.status(201).json({ message: saved.rows[0] })
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
   }),
 )
 
@@ -2237,6 +2557,91 @@ app.patch(
     } finally {
       client.release()
     }
+  }),
+)
+
+app.patch(
+  "/api/operation/tasks/:id/observation",
+  asyncRoute(async (req, res) => {
+    const id = positiveId.safeParse(req.params.id)
+    const parsed = providerObservationSchema.safeParse(req.body)
+    if (!id.success) throw new ApiError(400, "Identificador inválido.")
+    if (!parsed.success) {
+      throw new ApiError(400, "A observação deve ter no máximo 5.000 caracteres.")
+    }
+
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      const task = await client.query(
+        `SELECT t.id, t.status
+         FROM tarefas_operacao t
+         WHERE t.id = $1 AND t.created_by_user_id = $2
+           AND EXISTS (
+             SELECT 1 FROM proprietarios_adm_imoveis pai
+             JOIN usuarios u ON u.pessoa_id = pai.proprietarios_adm_id
+             WHERE pai.imoveis_id = t.imovel_id AND u.id = $2
+               AND u.tipo_pessoa = 'proprietario_adm'
+           )
+         FOR UPDATE`,
+        [id.data, req.user!.userId],
+      )
+      if (!task.rowCount) throw new ApiError(404, "Tarefa não encontrada.")
+      if (task.rows[0].status === "iniciar") {
+        throw new ApiError(
+          409,
+          "A observação compartilhada fica disponível após o início da tarefa.",
+        )
+      }
+
+      await client.query(
+        `UPDATE tarefas_operacao
+         SET observacao_prestador = $2
+         WHERE id = $1`,
+        [id.data, parsed.data.observation],
+      )
+      await client.query("COMMIT")
+      res.status(204).end()
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
+  }),
+)
+
+app.get(
+  "/api/operation/tasks/:taskId/images/:imageId",
+  asyncRoute(async (req, res) => {
+    const taskId = positiveId.safeParse(req.params.taskId)
+    const imageId = positiveId.safeParse(req.params.imageId)
+    if (!taskId.success || !imageId.success) {
+      throw new ApiError(400, "Identificador inválido.")
+    }
+    const result = await pool.query(
+      `SELECT image.image_data, image.image_mime_type
+       FROM tarefas_operacao_imagens image
+       JOIN tarefas_operacao t ON t.id = image.tarefa_id
+       WHERE t.id = $1 AND image.id = $2 AND t.created_by_user_id = $3
+         AND EXISTS (
+           SELECT 1 FROM proprietarios_adm_imoveis pai
+           JOIN usuarios u ON u.pessoa_id = pai.proprietarios_adm_id
+           WHERE pai.imoveis_id = t.imovel_id AND u.id = $3
+             AND u.tipo_pessoa = 'proprietario_adm'
+         )`,
+      [taskId.data, imageId.data, req.user!.userId],
+    )
+    const image = result.rows[0]
+    if (
+      !image?.image_data ||
+      !["image/jpeg", "image/png", "image/webp"].includes(image.image_mime_type)
+    ) {
+      throw new ApiError(404, "Imagem não encontrada.")
+    }
+    res.setHeader("Cache-Control", "private, no-store")
+    res.setHeader("X-Content-Type-Options", "nosniff")
+    res.type(image.image_mime_type).send(image.image_data)
   }),
 )
 

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react"
 import { api, type AppUser } from "./api"
+import TaskMessages from "./TaskMessages"
 
 type TaskStatus =
   | "iniciar"
@@ -18,6 +19,7 @@ type ProviderTask = {
   end_at: string | null
   status: TaskStatus
   provider_started: boolean
+  images: { id: string; created_at: string }[]
   checklists: {
     id: string
     title: string
@@ -50,6 +52,17 @@ const formatDate = (value: string | null) =>
       })
     : "Não informado"
 
+const readImageDataUrl = (file: File) =>
+  new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      if (typeof reader.result === "string") resolve(reader.result)
+      else reject(new Error("Não foi possível carregar a imagem."))
+    }
+    reader.onerror = () => reject(new Error("Não foi possível ler a imagem."))
+    reader.readAsDataURL(file)
+  })
+
 export default function ProviderHome({
   user,
   onLogout,
@@ -60,9 +73,8 @@ export default function ProviderHome({
   const [tasks, setTasks] = useState<ProviderTask[]>([])
   const [loading, setLoading] = useState(true)
   const [updating, setUpdating] = useState(false)
-  const [savingObservation, setSavingObservation] = useState(false)
+  const [uploadingImage, setUploadingImage] = useState(false)
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
-  const [observationDraft, setObservationDraft] = useState("")
   const [savedMessage, setSavedMessage] = useState("")
   const [error, setError] = useState("")
   const selectedTask = tasks.find((task) => task.id === selectedTaskId) ?? null
@@ -160,37 +172,48 @@ export default function ProviderHome({
     }
   }
 
-  async function saveObservation(taskId: string) {
-    setSavingObservation(true)
+  async function uploadImage(taskId: string, file: File) {
+    if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+      setError("Selecione uma imagem JPEG, PNG ou WebP.")
+      return
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      setError("A imagem deve ter no máximo 5 MB.")
+      return
+    }
+
+    setUploadingImage(true)
     setError("")
     setSavedMessage("")
     try {
-      await api(`/provider/tasks/${encodeURIComponent(taskId)}/observation`, {
-        method: "PATCH",
-        body: JSON.stringify({ observation: observationDraft }),
+      const imageDataUrl = await readImageDataUrl(file)
+      const result = await api<{
+        image: { id: string; created_at: string }
+      }>(`/provider/tasks/${encodeURIComponent(taskId)}/images`, {
+        method: "POST",
+        body: JSON.stringify({ imageDataUrl }),
       })
       setTasks((current) =>
         current.map((task) =>
           task.id === taskId
-            ? { ...task, provider_observation: observationDraft }
+            ? { ...task, images: [result.image, ...task.images] }
             : task,
         ),
       )
-      setSavedMessage("Observação salva.")
+      setSavedMessage("Imagem adicionada à tarefa.")
     } catch (reason) {
       setError(
         reason instanceof Error
           ? reason.message
-          : "Não foi possível salvar a observação.",
+          : "Não foi possível enviar a imagem.",
       )
     } finally {
-      setSavingObservation(false)
+      setUploadingImage(false)
     }
   }
 
   function openTask(task: ProviderTask) {
     setSelectedTaskId(task.id)
-    setObservationDraft(task.provider_observation ?? "")
     setSavedMessage("")
     setError("")
   }
@@ -302,39 +325,57 @@ export default function ProviderHome({
                 {selectedTask.observation}
               </p>
             )}
-            <label className="mt-5 block">
-              <span className="mb-2 block text-sm font-extrabold">
-                Sua observação
-              </span>
-              <textarea
-                value={observationDraft}
-                maxLength={5000}
-                rows={4}
-                onChange={(event) => {
-                  setObservationDraft(event.target.value)
-                  setSavedMessage("")
-                }}
-                className="w-full resize-y rounded-xl border border-[#dfe2db] bg-white px-3 py-3 text-sm outline-none focus:border-[#34705d]"
-                placeholder="Registre observações sobre a execução..."
+            {selectedTask.status !== "iniciar" && (
+              <TaskMessages
+                taskId={selectedTask.id}
+                endpoint="/provider/tasks"
+                legacyObservation={selectedTask.provider_observation}
+                defaultOpen
               />
-            </label>
-            <div className="mt-2 flex items-center justify-between gap-3">
-              {savedMessage ? (
-                <p className="text-xs font-bold text-[#34705d]">
-                  {savedMessage}
-                </p>
-              ) : (
-                <span />
-              )}
-              <button
-                type="button"
-                disabled={savingObservation}
-                onClick={() => void saveObservation(selectedTask.id)}
-                className="rounded-xl bg-[#173e37] px-4 py-2.5 text-xs font-extrabold text-white disabled:opacity-60"
-              >
-                {savingObservation ? "Salvando..." : "Salvar observação"}
-              </button>
-            </div>
+            )}
+            {(selectedTask.status !== "iniciar" || !!selectedTask.images.length) && (
+              <section className="mt-5 border-t border-[#eeece6] pt-4">
+                <h3 className="text-sm font-extrabold">
+                  Imagens de evidência ({selectedTask.images.length}/10)
+                </h3>
+                {selectedTask.status !== "iniciar" && (
+                  <label className="mt-3 inline-flex cursor-pointer items-center rounded-xl border border-[#dfe2db] bg-[#f8f7f2] px-4 py-2.5 text-xs font-extrabold text-[#34705d]">
+                    {uploadingImage ? "Enviando..." : "Adicionar imagem"}
+                    <input
+                      type="file"
+                      accept="image/jpeg,image/png,image/webp"
+                      disabled={uploadingImage || selectedTask.images.length >= 10}
+                      onChange={(event) => {
+                        const file = event.currentTarget.files?.[0]
+                        event.currentTarget.value = ""
+                        if (file) void uploadImage(selectedTask.id, file)
+                      }}
+                      className="sr-only"
+                    />
+                  </label>
+                )}
+                {!!selectedTask.images.length && (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {selectedTask.images.map((image, index) => (
+                      <a
+                        key={image.id}
+                        href={`/api/provider/tasks/${encodeURIComponent(selectedTask.id)}/images/${encodeURIComponent(image.id)}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="block h-20 w-20 overflow-hidden rounded-xl border border-[#dfe2db]"
+                      >
+                        <img
+                          src={`/api/provider/tasks/${encodeURIComponent(selectedTask.id)}/images/${encodeURIComponent(image.id)}`}
+                          alt={`Evidência ${index + 1} da tarefa`}
+                          loading="lazy"
+                          className="h-full w-full object-cover"
+                        />
+                      </a>
+                    ))}
+                  </div>
+                )}
+              </section>
+            )}
             {selectedTask.checklists.map((checklist) => (
               <section
                 key={checklist.id}
