@@ -1515,9 +1515,20 @@ function OperationScreen({
 }) {
   const [addingTemplateId, setAddingTemplateId] = useState("")
   const [actionError, setActionError] = useState("")
+  const [focusTaskId, setFocusTaskId] = useState<string | null>(null)
   const [historyStatus, setHistoryStatus] = useState<
     OperationTaskStatus | "todos"
   >("todos")
+
+  useEffect(() => {
+    if (filter !== "Tarefas" || !focusTaskId) return
+    const taskCard = document.getElementById(`operation-task-${focusTaskId}`)
+    if (taskCard) {
+      taskCard.scrollIntoView({ behavior: "smooth", block: "center" })
+      taskCard.focus({ preventScroll: true })
+    }
+    setFocusTaskId(null)
+  }, [filter, focusTaskId])
 
   const historyTasks = tasks
     .filter(
@@ -1670,6 +1681,17 @@ function OperationScreen({
                           })
                         : "Não definida"}
                     </p>
+                    <button
+                      type="button"
+                      aria-label={`Abrir tarefa ${task.name}`}
+                      onClick={() => {
+                        setFocusTaskId(task.id)
+                        setFilter("Tarefas")
+                      }}
+                      className="mt-3 rounded-full border border-[#dfe2db] px-3 py-2 text-[10px] font-extrabold text-[#34705d] hover:bg-[#f7f8f4]"
+                    >
+                      Abrir tarefa
+                    </button>
                   </article>
                 )
               })}
@@ -1828,7 +1850,11 @@ function OperationTaskCard({
   )
 
   return (
-    <article className="rounded-[22px] border border-[#e4e6df] bg-white p-4 shadow-[0_6px_18px_rgba(25,39,35,.04)]">
+    <article
+      id={`operation-task-${task.id}`}
+      tabIndex={-1}
+      className="rounded-[22px] border border-[#e4e6df] bg-white p-4 shadow-[0_6px_18px_rgba(25,39,35,.04)] focus:outline-none"
+    >
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <h3 className="break-words text-sm font-extrabold text-[#20352f]">
