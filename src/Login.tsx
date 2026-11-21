@@ -1,89 +1,7 @@
 import { useState, type FormEvent } from "react"
 
 import { api, type AppUser } from "./api"
-
-type PlanId = "mensal" | "semestral" | "anual"
-
-type Plan = {
-  id: PlanId
-
-  name: string
-
-  price: number
-
-  cadence: string
-
-  description: string
-
-  additionalPropertyPrice: number
-
-  additionalPropertyCadence: string
-
-  featured?: boolean
-}
-
-const plans: Plan[] = [
-  {
-    id: "mensal",
-
-    name: "Mensal",
-
-    price: 20,
-
-    cadence: "por mês",
-
-    description: "Flexibilidade para começar",
-
-    additionalPropertyPrice: 10,
-
-    additionalPropertyCadence: "por mês por imóvel adicional",
-  },
-
-  {
-    id: "semestral",
-
-    name: "Semestral",
-
-    price: 90,
-
-    cadence: "a cada 6 meses",
-
-    description: "Economize R$ 30 no período",
-
-    additionalPropertyPrice: 45,
-
-    additionalPropertyCadence:
-      "por imóvel adicional a cada 6 meses (25% de desconto)",
-
-    featured: true,
-  },
-
-  {
-    id: "anual",
-
-    name: "Anual",
-
-    price: 144,
-
-    cadence: "por ano",
-
-    description: "Economize R$ 96 no ano",
-
-    additionalPropertyPrice: 72,
-
-    additionalPropertyCadence:
-      "por imóvel adicional por ano (40% de desconto)",
-  },
-]
-
-const formatPrice = (price: number) =>
-  new Intl.NumberFormat("pt-BR", {
-    style: "currency",
-
-    currency: "BRL",
-
-    maximumFractionDigits: 2,
-  }).format(price)
+import { formatPrice, plans, type PlanId } from "./plans"
 
 export default function Login({
   onLogin,
@@ -653,8 +571,8 @@ export default function Login({
                 </p>
               </div>
               <p className="mt-4 border-t border-white/15 pt-4 text-[11px] leading-5 text-white/55">
-                As formas de pagamento são apenas informativas nesta etapa.
-                Cobranças online ainda não estão habilitadas.
+                O pagamento é feito via Pix na página inicial após criar sua
+                conta.
               </p>
               <p className="mt-2 text-[11px] leading-5 text-white/55">
                 Inclui até 3 imóveis. Imóvel adicional:{" "}
@@ -758,17 +676,10 @@ export default function Login({
             </div>
             <div>
               <p className="mb-2 text-xs font-extrabold text-[#59645f]">
-                Formas de pagamentos disponíveis
+                Forma de pagamento
               </p>
-              <div className="grid grid-cols-3 gap-2">
-                {["Cartão", "Boleto", "PIX"].map((method) => (
-                  <div
-                    key={method}
-                    className="rounded-2xl border border-[#dfded7] bg-white px-3 py-3 text-center text-sm font-extrabold text-[#66736d]"
-                  >
-                    {method}
-                  </div>
-                ))}
+              <div className="rounded-2xl border border-[#dfded7] bg-white px-3 py-3 text-center text-sm font-extrabold text-[#66736d]">
+                Pix
               </div>
             </div>
             <label className="flex items-start gap-3 rounded-2xl border border-[#e2e0d9] bg-white p-3 text-left text-[11px] font-semibold leading-5 text-[#5f6e6a]">

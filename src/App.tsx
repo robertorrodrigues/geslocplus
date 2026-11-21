@@ -5,11 +5,14 @@ import {
   type ChangeEvent,
   type FormEvent,
 } from "react"
+import QRCode from "qrcode"
 import { api, ApiError, initials, type AppUser } from "./api"
+import BillingPage from "./BillingPage"
 import Login from "./Login"
 import PlatformAdminHome from "./PlatformAdminHome"
 import PasswordChange from "./PasswordChange"
 import ProviderHome from "./ProviderHome"
+import { createPixPayload } from "./pix"
 import TaskMessages from "./TaskMessages"
 
 type IconName = "home" | "building" | "check" | "users" | "bell" | "chevron" | "arrow" | "calendar" | "clock" | "pin" | "more" | "plus" | "search" | "filter" | "bed" | "sparkle" | "tool" | "key" | "wallet" | "briefcase" | "close" | "userPlus" | "clipboard"
@@ -249,6 +252,9 @@ type Person = {
   role: string
   email: string
   phone: string
+  address: string
+  city: string
+  state: string
   cpfCnpj: string
   pixCode: string
   color: string
@@ -294,6 +300,9 @@ type PersonResponse = {
   kind: Person["kind"]
   email: string | null
   phone: string | null
+  address: string | null
+  city: string | null
+  state: string | null
   cpf_cnpj: string | null
   pix_code: string | null
   is_archived: boolean
@@ -412,7 +421,7 @@ const readImageDataUrl = (file: File) =>
     reader.readAsDataURL(file)
   })
 
-type Tab = "home" | "properties" | "operation" | "people"
+type Tab = "home" | "properties" | "operation" | "people" | "billing"
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("home")
@@ -523,6 +532,9 @@ export default function App() {
             role: roles[(item.kind as Person["kind"])],
             email: item.email || "",
             phone: item.phone || "",
+            address: item.address || "",
+            city: item.city || "",
+            state: item.state || "",
             cpfCnpj: item.cpf_cnpj || "",
             pixCode: item.pix_code || "",
             color:
@@ -849,6 +861,7 @@ export default function App() {
         properties: "Meus imóveis",
         operation: "Operação",
         people: "Pessoas",
+        billing: "Pagamento",
       })[tab],
     [tab],
   )
@@ -935,10 +948,19 @@ export default function App() {
               tasks={tasks}
               properties={properties}
               dashboard={dashboard}
+              trialEndsAt={user.trialEndsAt}
               onToggleTask={toggleTask}
               onProperty={setSelectedProperty}
               onSeeOperation={() => setTab("operation")}
               onSeeProperties={() => setTab("properties")}
+              onOpenBilling={() => setTab("billing")}
+            />
+          )}
+          {tab === "billing" && (
+            <BillingPage
+              propertyCount={dashboard.properties}
+              isDataReady={!dataLoading && !dataError}
+              onBack={() => setTab("home")}
             />
           )}
           {tab === "properties" && (
@@ -999,7 +1021,9 @@ export default function App() {
           )}
         </div>
 
-        <BottomNav active={tab} setActive={setTab} />
+        {tab !== "billing" && (
+          <BottomNav active={tab} setActive={setTab} />
+        )}
         {selectedProperty && (
           <PropertyDetail
             property={selectedProperty}
@@ -1161,21 +1185,47 @@ function HomeScreen({
   tasks,
   properties,
   dashboard,
+  trialEndsAt,
   onToggleTask,
   onProperty,
   onSeeOperation,
   onSeeProperties,
+  onOpenBilling,
 }: {
   tasks: Task[]
   properties: Property[]
   dashboard: Dashboard
+  trialEndsAt?: string | null
   onToggleTask: (id: string) => void
   onProperty: (property: Property) => void
   onSeeOperation: () => void
   onSeeProperties: () => void
+  onOpenBilling: () => void
 }) {
+  const [currentTime, setCurrentTime] = useState(Date.now())
   const operationTasks = tasks.filter((task) => task.category === "operation")
   const completed = operationTasks.filter((task) => task.done).length
+  const trialEndsAtTime = trialEndsAt ? Date.parse(trialEndsAt) : Number.NaN
+  const trialDaysRemaining = Number.isFinite(trialEndsAtTime)
+    ? Math.max(0, Math.ceil((trialEndsAtTime - currentTime) / 86_400_000))
+    : null
+  const trialMessage =
+    trialDaysRemaining === null
+      ? "Não foi possível determinar o período de teste."
+      : trialDaysRemaining > 0
+        ? `Faltam ${trialDaysRemaining} ${
+            trialDaysRemaining === 1 ? "dia" : "dias"
+          } de teste`
+        : "Seu período de teste terminou"
+
+  useEffect(() => {
+    const interval = window.setInterval(
+      () => setCurrentTime(Date.now()),
+      60_000,
+    )
+    return () => window.clearInterval(interval)
+  }, [])
+
   return (
     <>
       <section className="mx-5 overflow-hidden rounded-[28px] bg-[#173e37] p-5 text-white shadow-[0_18px_40px_rgba(20,58,51,.2)]">
@@ -1203,6 +1253,24 @@ function HomeScreen({
             label="Tarefas concluídas"
           />
         </div>
+      </section>
+
+      <section className="mx-5 mt-5 flex items-center justify-between gap-3 rounded-[22px] border border-[#dce7df] bg-white p-4">
+        <div>
+          <p className="text-[10px] font-extrabold uppercase tracking-[.12em] text-[#7b8781]">
+            Período de teste
+          </p>
+          <p className="mt-1 text-sm font-extrabold text-[#173e37]">
+            {trialMessage}
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onOpenBilling}
+          className="shrink-0 rounded-xl bg-[#ed765f] px-3 py-2.5 text-[10px] font-extrabold text-white"
+        >
+          Escolher plano
+        </button>
       </section>
 
       <section className="px-5 pt-7">
@@ -1532,7 +1600,9 @@ function OperationScreen({
 
   const historyTasks = tasks
     .filter(
-      (task) => historyStatus === "todos" || task.status === historyStatus,
+      (task) =>
+        !isTaskPending(task.status) &&
+        (historyStatus === "todos" || task.status === historyStatus),
     )
     .sort((first, second) => {
       if (!first.end_at) return second.end_at ? 1 : 0
@@ -1607,20 +1677,21 @@ function OperationScreen({
         </div>
         {filter === "Tarefas" ? (
           <div className="space-y-3">
-            {tasks.map((task) => (
-              <OperationTaskCard
-                key={task.id}
-                task={task}
-                onEdit={() => onEditTask(task)}
-                onStatus={onTaskStatus}
-                onToggleItem={onToggleChecklistItem}
-                onDelete={onDeleteTask}
-              />
-            ))}
-            {!tasks.length && (
+            {tasks
+              .filter((task) => isTaskPending(task.status))
+              .map((task) => (
+                <OperationTaskCard
+                  key={task.id}
+                  task={task}
+                  onEdit={() => onEditTask(task)}
+                  onStatus={onTaskStatus}
+                  onToggleItem={onToggleChecklistItem}
+                  onDelete={onDeleteTask}
+                />
+              ))}
+            {!tasks.some((task) => isTaskPending(task.status)) && (
               <p className="rounded-2xl border border-[#ebe9e1] bg-white p-4 text-xs font-semibold text-[#89918d]">
-                Nenhuma tarefa cadastrada. Crie uma tarefa para vinculá-la a um
-                imóvel.
+                Nenhuma tarefa para iniciar ou em andamento.
               </p>
             )}
           </div>
@@ -1642,11 +1713,13 @@ function OperationScreen({
                 className="w-full rounded-2xl border border-[#dfded7] bg-white px-4 py-3 text-xs font-bold outline-none focus:border-[#34705d]"
               >
                 <option value="todos">Todos os status</option>
-                {operationTaskStatuses.map((status) => (
-                  <option key={status.value} value={status.value}>
-                    {status.label}
-                  </option>
-                ))}
+                {operationTaskStatuses
+                  .filter((status) => !isTaskPending(status.value))
+                  .map((status) => (
+                    <option key={status.value} value={status.value}>
+                      {status.label}
+                    </option>
+                  ))}
               </select>
             </label>
             {historyTasks.map((task) => {
@@ -2688,6 +2761,7 @@ function PeopleScreen({
   onActivate: (person: Person) => void
 }) {
   const [showArchived, setShowArchived] = useState(false)
+  const [payingPerson, setPayingPerson] = useState<Person | null>(null)
   const filtered = people.filter((person) => {
     if (person.isArchived !== showArchived) return false
     if (filter === "Todos") return true
@@ -2696,76 +2770,87 @@ function PeopleScreen({
     return person.kind === "provider"
   })
   return (
-    <section>
-      <div className="px-5">
-        <div className="mb-5 flex gap-2">
-          <div className="flex flex-1 items-center gap-2 rounded-2xl border border-[#e2e1da] bg-white px-4 py-3 text-[#8e9692]">
-            <Icon name="search" size={18} />
-            <span className="text-sm font-semibold">Buscar pessoa</span>
+    <>
+      <section>
+        <div className="px-5">
+          <div className="mb-5 flex gap-2">
+            <div className="flex flex-1 items-center gap-2 rounded-2xl border border-[#e2e1da] bg-white px-4 py-3 text-[#8e9692]">
+              <Icon name="search" size={18} />
+              <span className="text-sm font-semibold">Buscar pessoa</span>
+            </div>
+            <button
+              onClick={onAdd}
+              className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[#ed765f] text-white shadow-[0_8px_20px_rgba(237,118,95,.25)]"
+              aria-label="Adicionar pessoa"
+            >
+              <Icon name="userPlus" size={19} />
+            </button>
           </div>
-          <button
-            onClick={onAdd}
-            className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[#ed765f] text-white shadow-[0_8px_20px_rgba(237,118,95,.25)]"
-            aria-label="Adicionar pessoa"
-          >
-            <Icon name="userPlus" size={19} />
-          </button>
         </div>
-      </div>
-      <div className="no-scrollbar flex gap-2 overflow-x-auto px-5 pb-5">
-        {["Todos", "Admins", "Prepostos", "Prestadores"].map((item) => (
-          <button
-            key={item}
-            onClick={() => setFilter(item)}
-            className={`shrink-0 rounded-full px-4 py-2 text-[11px] font-extrabold transition ${
-              filter === item
-                ? "bg-[#173e37] text-white"
-                : "border border-[#dfded7] bg-white text-[#707a76]"
-            }`}
-          >
-            {item}
-          </button>
-        ))}
-      </div>
-      <div className="mx-5 mb-5 rounded-[20px] bg-[#e7f0eb] p-4">
-        <p className="text-[11px] font-bold leading-relaxed text-[#48645d]">
-          Arquivar mantém tarefas, vínculos e histórico. Marque “Mostrar
-          excluídos” para reativar uma pessoa.
-        </p>
-      </div>
-      <div className="px-5">
-        <div className="mb-3 flex items-center justify-between gap-3">
-          <h2 className="text-sm font-extrabold">{filtered.length} pessoas</h2>
-          <label className="flex shrink-0 items-center gap-2 text-[10px] font-bold text-[#59645f]">
-            <input
-              type="checkbox"
-              checked={showArchived}
-              onChange={(event) => setShowArchived(event.target.checked)}
-              className="h-4 w-4 accent-[#173e37]"
-            />
-            Mostrar excluídos
-          </label>
-        </div>
-        <div className="overflow-hidden rounded-[24px] border border-[#e5e3dc] bg-white">
-          {filtered.map((person, index) => (
-            <PersonRow
-              key={person.id}
-              person={person}
-              last={index === filtered.length - 1}
-              onEdit={() => onEdit(person)}
-              onArchive={() => onArchive(person)}
-              onReactivate={() => onReactivate(person)}
-              onActivate={() => onActivate(person)}
-            />
+        <div className="no-scrollbar flex gap-2 overflow-x-auto px-5 pb-5">
+          {["Todos", "Admins", "Prepostos", "Prestadores"].map((item) => (
+            <button
+              key={item}
+              onClick={() => setFilter(item)}
+              className={`shrink-0 rounded-full px-4 py-2 text-[11px] font-extrabold transition ${
+                filter === item
+                  ? "bg-[#173e37] text-white"
+                  : "border border-[#dfded7] bg-white text-[#707a76]"
+              }`}
+            >
+              {item}
+            </button>
           ))}
-          {!filtered.length && (
-            <p className="p-4 text-xs font-semibold text-[#89918d]">
-              Nenhuma pessoa cadastrada nesta categoria.
-            </p>
-          )}
         </div>
-      </div>
-    </section>
+        <div className="mx-5 mb-5 rounded-[20px] bg-[#e7f0eb] p-4">
+          <p className="text-[11px] font-bold leading-relaxed text-[#48645d]">
+            Arquivar mantém tarefas, vínculos e histórico. Marque “Mostrar
+            excluídos” para reativar uma pessoa.
+          </p>
+        </div>
+        <div className="px-5">
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <h2 className="text-sm font-extrabold">
+              {filtered.length} pessoas
+            </h2>
+            <label className="flex shrink-0 items-center gap-2 text-[10px] font-bold text-[#59645f]">
+              <input
+                type="checkbox"
+                checked={showArchived}
+                onChange={(event) => setShowArchived(event.target.checked)}
+                className="h-4 w-4 accent-[#173e37]"
+              />
+              Mostrar excluídos
+            </label>
+          </div>
+          <div className="overflow-hidden rounded-[24px] border border-[#e5e3dc] bg-white">
+            {filtered.map((person, index) => (
+              <PersonRow
+                key={person.id}
+                person={person}
+                last={index === filtered.length - 1}
+                onEdit={() => onEdit(person)}
+                onArchive={() => onArchive(person)}
+                onReactivate={() => onReactivate(person)}
+                onActivate={() => onActivate(person)}
+                onPay={() => setPayingPerson(person)}
+              />
+            ))}
+            {!filtered.length && (
+              <p className="p-4 text-xs font-semibold text-[#89918d]">
+                Nenhuma pessoa cadastrada nesta categoria.
+              </p>
+            )}
+          </div>
+        </div>
+      </section>
+      {payingPerson && (
+        <PixPaymentDialog
+          person={payingPerson}
+          onClose={() => setPayingPerson(null)}
+        />
+      )}
+    </>
   )
 }
 
@@ -2776,6 +2861,7 @@ function PersonRow({
   onArchive,
   onReactivate,
   onActivate,
+  onPay,
 }: {
   person: Person
   last: boolean
@@ -2783,6 +2869,7 @@ function PersonRow({
   onArchive: () => void
   onReactivate: () => void
   onActivate: () => void
+  onPay: () => void
 }) {
   const colors: Record<string, string> = {
     coral: "bg-[#f9d8d0] text-[#b8523e]",
@@ -2821,6 +2908,16 @@ function PersonRow({
               {person.phone}
             </p>
           )}
+          {person.address && (
+            <p className="mt-1 truncate text-[9px] font-semibold text-[#64706a]">
+              {person.address}
+            </p>
+          )}
+          {(person.city || person.state) && (
+            <p className="mt-1 truncate text-[9px] font-semibold text-[#64706a]">
+              {[person.city, person.state].filter(Boolean).join(", ")}
+            </p>
+          )}
           {person.kind === "provider" && person.pixCode && (
             <p className="mt-1 break-all text-[9px] font-semibold text-[#64706a]">
               PIX: {person.pixCode}
@@ -2829,6 +2926,15 @@ function PersonRow({
         </div>
       </div>
       <div className="mt-3 flex justify-end gap-2">
+        {person.kind === "provider" && !person.isArchived && (
+          <button
+            type="button"
+            onClick={onPay}
+            className="rounded-xl bg-[#173e37] px-3 py-2 text-[10px] font-extrabold text-white"
+          >
+            Pague
+          </button>
+        )}
         {person.kind === "provider" && !person.isArchived && (
           <button
             type="button"
@@ -2865,6 +2971,199 @@ function PersonRow({
         )}
       </div>
     </article>
+  )
+}
+
+function PixPaymentDialog({
+  person,
+  onClose,
+}: {
+  person: Person
+  onClose: () => void
+}) {
+  const [amount, setAmount] = useState("")
+  const [qrCode, setQrCode] = useState("")
+  const [pixPayload, setPixPayload] = useState("")
+  const [error, setError] = useState("")
+  const [isGenerating, setIsGenerating] = useState(false)
+  const [copied, setCopied] = useState(false)
+
+  async function generatePayment(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setError("")
+    setCopied(false)
+    setQrCode("")
+    setPixPayload("")
+
+    const normalizedAmount = amount.trim().replace(",", ".")
+    if (!/^\d+(?:\.\d{1,2})?$/.test(normalizedAmount)) {
+      setError("Informe um valor válido, com até duas casas decimais.")
+      return
+    }
+
+    const amountInCents = Math.round(Number(normalizedAmount) * 100)
+    if (!Number.isSafeInteger(amountInCents) || amountInCents <= 0) {
+      setError("O valor do pagamento deve ser maior que zero.")
+      return
+    }
+
+    setIsGenerating(true)
+    try {
+      const payload = createPixPayload({
+        key: person.pixCode,
+        amountInCents,
+        receiverName: person.name,
+        city: person.city,
+      })
+      const image = await QRCode.toDataURL(payload, {
+        errorCorrectionLevel: "M",
+        margin: 2,
+        width: 256,
+      })
+      setPixPayload(payload)
+      setQrCode(image)
+    } catch (reason) {
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : "Não foi possível gerar o QR Code Pix.",
+      )
+    } finally {
+      setIsGenerating(false)
+    }
+  }
+
+  async function copyPixPayload() {
+    try {
+      await navigator.clipboard.writeText(pixPayload)
+      setCopied(true)
+      setError("")
+    } catch {
+      setError("Não foi possível copiar. Selecione e copie o código Pix.")
+    }
+  }
+
+  const parsedAmount = Number(amount.trim().replace(",", "."))
+  const formattedAmount =
+    Number.isFinite(parsedAmount) && parsedAmount > 0
+      ? new Intl.NumberFormat("pt-BR", {
+          style: "currency",
+          currency: "BRL",
+        }).format(parsedAmount)
+      : ""
+
+  return (
+    <div
+      className="fixed inset-0 z-[110] flex items-center justify-center bg-[#172321]/55 p-4"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose()
+      }}
+    >
+      <section
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="pix-payment-title"
+        className="max-h-[90vh] w-full max-w-[420px] overflow-y-auto rounded-[24px] bg-[#fbfaf7] p-5 shadow-2xl"
+      >
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h2
+              id="pix-payment-title"
+              className="text-lg font-extrabold text-[#173e37]"
+            >
+              Pagamento Pix
+            </h2>
+            <p className="mt-1 text-xs font-semibold text-[#64706a]">
+              Para {person.name}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-xl border border-[#dfe2db] px-3 py-2 text-xs font-extrabold text-[#34705d]"
+          >
+            Fechar
+          </button>
+        </div>
+
+        {!person.pixCode.trim() && (
+          <p
+            role="alert"
+            className="mt-4 rounded-2xl border border-[#f1c8bd] bg-[#fff1ec] p-3 text-xs font-bold text-[#a84734]"
+          >
+            Este prestador ainda não tem uma chave Pix cadastrada. Adicione a
+            chave em Alterar para gerar o pagamento.
+          </p>
+        )}
+
+        <form onSubmit={generatePayment}>
+          <label className="mt-5 block">
+            <span className="field-label">Valor do pagamento (R$)</span>
+            <input
+              type="text"
+              inputMode="decimal"
+              value={amount}
+              onChange={(event) => {
+                setAmount(event.target.value)
+                setError("")
+                setQrCode("")
+                setPixPayload("")
+              }}
+              placeholder="0,00"
+              className="w-full rounded-2xl border border-[#dfded7] bg-white px-4 py-3 text-sm font-bold outline-none focus:border-[#34705d]"
+            />
+          </label>
+          <button
+            type="submit"
+            disabled={!person.pixCode.trim() || isGenerating}
+            className="primary-button mt-4 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {isGenerating ? "Gerando..." : "Gerar QR Code"}
+          </button>
+        </form>
+
+        {error && (
+          <p
+            role="alert"
+            className="mt-3 rounded-xl bg-[#fff1ec] p-3 text-xs font-bold text-[#a84734]"
+          >
+            {error}
+          </p>
+        )}
+
+        {qrCode && (
+          <div className="mt-5 rounded-2xl border border-[#e5e3dc] bg-white p-4 text-center">
+            <p className="text-sm font-extrabold text-[#173e37]">
+              {formattedAmount}
+            </p>
+            <img
+              src={qrCode}
+              alt={`QR Code Pix de ${formattedAmount} para ${person.name}`}
+              className="mx-auto mt-3 h-64 w-64 max-w-full"
+            />
+            <p className="mt-2 text-xs font-bold text-[#64706a]">
+              Escaneie o QR Code no app do seu banco
+            </p>
+            <label className="mt-4 block text-left">
+              <span className="field-label">Pix copia e cola</span>
+              <textarea
+                readOnly
+                value={pixPayload}
+                rows={4}
+                className="w-full resize-none rounded-xl border border-[#dfe2db] bg-[#f8f7f2] p-3 text-[10px] font-semibold text-[#35423f]"
+              />
+            </label>
+            <button
+              type="button"
+              onClick={() => void copyPixPayload()}
+              className="mt-3 w-full rounded-xl bg-[#e7f0eb] px-4 py-3 text-xs font-extrabold text-[#34705d]"
+            >
+              {copied ? "Código copiado" : "Copiar Pix copia e cola"}
+            </button>
+          </div>
+        )}
+      </section>
+    </div>
   )
 }
 
@@ -3448,6 +3747,9 @@ function AddSheet({
               fullName: initialPerson.name,
               email: initialPerson.email,
               phone: initialPerson.phone,
+              address: initialPerson.address,
+              city: initialPerson.city,
+              state: initialPerson.state,
               cpfCnpj: initialPerson.cpfCnpj,
               pixCode: initialPerson.pixCode,
             }
@@ -3534,6 +3836,9 @@ function AddSheet({
           fullName: values.fullName,
           email: values.email || "",
           phone: values.phone || "",
+          address: values.address || "",
+          city: values.city || "",
+          state: values.state || "",
           cpfCnpj: values.cpfCnpj || "",
           kind: kinds[role],
           pixCode: role === "Prestador" ? values.pixCode || "" : "",
@@ -3740,6 +4045,27 @@ function AddSheet({
               placeholder="(00) 00000-0000"
               value={values.phone || ""}
               onChange={(value) => setValue("phone", value)}
+            />
+            <Field
+              label="Endereço"
+              placeholder="Rua, número, complemento e bairro"
+              value={values.address || ""}
+              onChange={(value) => setValue("address", value)}
+              maxLength={500}
+            />
+            <Field
+              label="Cidade"
+              placeholder="Digite a cidade"
+              value={values.city || ""}
+              onChange={(value) => setValue("city", value)}
+              maxLength={120}
+            />
+            <Field
+              label="Estado (UF)"
+              placeholder="Ex.: RJ"
+              value={values.state || ""}
+              onChange={(value) => setValue("state", value.toUpperCase())}
+              maxLength={2}
             />
             <Field
               label="CPF/CNPJ"

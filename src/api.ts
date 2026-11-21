@@ -4,6 +4,7 @@ export type AppUser = {
   email: string
   role: "administrator" | "platform_admin" | "provider"
   mustChangePassword: boolean
+  trialEndsAt?: string | null
 }
 
 export class ApiError extends Error {

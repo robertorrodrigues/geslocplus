@@ -85,6 +85,16 @@ const app = express()
 const cookieName = "geslocplus_session"
 
 const sessionDurationMs = 12 * 60 * 60 * 1000
+const trialDurationMs = 10 * 24 * 60 * 60 * 1000
+
+const getTrialEndsAt = (createdAt: Date | string | null | undefined) => {
+  if (!createdAt) return null
+  const timestamp =
+    createdAt instanceof Date ? createdAt.getTime() : Date.parse(createdAt)
+  return Number.isFinite(timestamp)
+    ? new Date(timestamp + trialDurationMs).toISOString()
+    : null
+}
 
 type AuthClaims = {
   userId: string
@@ -336,6 +346,12 @@ const personSchema = z.object({
 
   phone: z.string().trim().max(40).optional(),
 
+  address: z.string().trim().max(500).optional(),
+
+  city: z.string().trim().max(120).optional(),
+
+  state: z.string().trim().max(2).optional(),
+
   cpfCnpj: z.string().trim().max(30).optional(),
 
   pixCode: z.string().trim().max(200).optional(),
@@ -345,6 +361,9 @@ const personUpdateSchema = z.object({
   fullName: z.string().trim().min(2).max(160),
   email: emailSchema.optional().or(z.literal("")),
   phone: z.string().trim().max(40).optional(),
+  address: z.string().trim().max(500).optional(),
+  city: z.string().trim().max(120).optional(),
+  state: z.string().trim().max(2).optional(),
   cpfCnpj: z.string().trim().max(30).optional(),
   pixCode: z.string().trim().max(200).optional(),
 })
@@ -581,7 +600,7 @@ app.post(
 
     const result = await pool.query(
       `SELECT u.id, u.nome, u.email, u.password_hash, u.tipo_pessoa,
-              u.must_change_password,
+              u.must_change_password, u.dt_criacao,
               CASE WHEN u.tipo_pessoa = 'prestador_servico'
                    THEN coalesce(ps.archived_at IS NOT NULL, true)
                    ELSE false END AS provider_unavailable
@@ -657,6 +676,10 @@ app.post(
               ? "provider"
               : "administrator",
         mustChangePassword: user.must_change_password,
+        trialEndsAt:
+          user.tipo_pessoa === "proprietario_adm"
+            ? getTrialEndsAt(user.dt_criacao)
+            : null,
       },
     })
   }),
@@ -700,7 +723,7 @@ app.post(
       const userResult = await client.query(
         `INSERT INTO usuarios (nome, email, password_hash, pessoa_id, tipo_pessoa)
          VALUES ($1, $2, $3, $4, $5)
-         RETURNING id, nome, email`,
+         RETURNING id, nome, email, dt_criacao`,
         [fullName, email, passwordHash, personResult.rows[0].id, "proprietario_adm"],
       )
 
@@ -739,6 +762,7 @@ app.post(
           email: user.email,
           role: "administrator",
           mustChangePassword: false,
+          trialEndsAt: getTrialEndsAt(user.dt_criacao),
         },
         plan,
       })
@@ -780,7 +804,7 @@ app.post(
       `UPDATE usuarios
        SET password_hash = $2, must_change_password = false, dt_alteracao = now()
        WHERE id = $1
-       RETURNING id, nome, email, tipo_pessoa, must_change_password`,
+       RETURNING id, nome, email, tipo_pessoa, must_change_password, dt_criacao`,
       [req.user!.userId, passwordHash],
     )
     const user = updated.rows[0]
@@ -813,6 +837,10 @@ app.post(
               ? "provider"
               : "administrator",
         mustChangePassword: user.must_change_password,
+        trialEndsAt:
+          user.tipo_pessoa === "proprietario_adm"
+            ? getTrialEndsAt(user.dt_criacao)
+            : null,
       },
     })
   }),
@@ -832,6 +860,7 @@ app.get(
 
     const result = await pool.query(
       `SELECT u.id, u.nome, u.email, u.tipo_pessoa, u.must_change_password,
+              u.dt_criacao,
               CASE WHEN u.tipo_pessoa = 'prestador_servico'
                    THEN coalesce(ps.archived_at IS NOT NULL, true)
                    ELSE false END AS provider_unavailable
@@ -872,6 +901,10 @@ app.get(
               ? "provider"
               : "administrator",
         mustChangePassword: result.rows[0].must_change_password,
+        trialEndsAt:
+          result.rows[0].tipo_pessoa === "proprietario_adm"
+            ? getTrialEndsAt(result.rows[0].dt_criacao)
+            : null,
       },
     })
   }),
@@ -1441,6 +1474,24 @@ app.patch(
 app.use("/api", authRequired, proprietarioAdminRequired)
 
 app.get(
+  "/api/billing/pix-config",
+  asyncRoute(async (_req, res) => {
+    const key = process.env.PIX_RECEIVER_KEY?.trim() || null
+    const name = process.env.PIX_RECEIVER_NAME?.trim() || null
+    const city = process.env.PIX_RECEIVER_CITY?.trim() || null
+    const configured = Boolean(key && name && city)
+
+    res.setHeader("Cache-Control", "private, no-store")
+    res.json({
+      configured,
+      key: configured ? key : null,
+      name: configured ? name : null,
+      city: configured ? city : null,
+    })
+  }),
+)
+
+app.get(
   "/api/dashboard",
 
   asyncRoute(async (req, res) => {
@@ -2003,18 +2054,21 @@ app.get(
     const result = await pool.query(
       `SELECT 'proprietario_adm:' || id::text AS id, nome AS full_name,
               'administrator'::text AS kind, email, telefone AS phone,
+              endereco AS address, cidade AS city, estado AS state,
               cpf_cnpj, NULL::text AS pix_code,
               archived_at IS NOT NULL AS is_archived, FALSE AS has_platform_user
        FROM proprietarios_adm
        WHERE created_by_user_id = $1
        UNION ALL
        SELECT 'preposto:' || id::text, nome, 'proxy'::text, email,
-              telefone, cpf_cnpj, NULL::text, archived_at IS NOT NULL, FALSE
+              telefone, endereco, cidade, estado, cpf_cnpj, NULL::text,
+              archived_at IS NOT NULL, FALSE
        FROM prepostos
        WHERE created_by_user_id = $1
        UNION ALL
        SELECT 'prestador_servico:' || id::text, nome, 'provider'::text, email,
-              telefone, cpf_cnpj, codigo_pix, archived_at IS NOT NULL,
+              telefone, endereco, cidade, estado, cpf_cnpj, codigo_pix,
+              archived_at IS NOT NULL,
               EXISTS (
                 SELECT 1 FROM usuarios u
                 WHERE u.pessoa_id = prestadores_servico.id
@@ -2121,28 +2175,46 @@ app.post(
 
     if (!parsed.success) throw new ApiError(400, "Confira os dados da pessoa.")
 
-    const { fullName, email, phone, cpfCnpj, pixCode, kind } = parsed.data
+    const {
+      fullName,
+      email,
+      phone,
+      address,
+      city,
+      state,
+      cpfCnpj,
+      pixCode,
+      kind,
+    } = parsed.data
 
     const params = [
       fullName,
       email || null,
       phone || null,
       cpfCnpj || null,
+      address || null,
+      city || null,
+      state?.toUpperCase() || null,
       req.user!.userId,
     ]
 
     const insertByKind = {
       administrator: `INSERT INTO proprietarios_adm
-                         (nome, email, telefone, cpf_cnpj, created_by_user_id)
-                       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+                         (nome, email, telefone, cpf_cnpj, endereco, cidade,
+                          estado, created_by_user_id)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                       RETURNING id`,
 
       proxy: `INSERT INTO prepostos
-                (nome, email, telefone, cpf_cnpj, tipo, status, created_by_user_id)
-              VALUES ($1, $2, $3, $4, 'preposto', 'ativo', $5) RETURNING id`,
+                (nome, email, telefone, cpf_cnpj, endereco, cidade, estado,
+                 tipo, status, created_by_user_id)
+              VALUES ($1, $2, $3, $4, $5, $6, $7, 'preposto', 'ativo', $8)
+              RETURNING id`,
 
       provider: `INSERT INTO prestadores_servico
-                   (nome, email, telefone, cpf_cnpj, codigo_pix, created_by_user_id)
-                 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+                   (nome, email, telefone, cpf_cnpj, endereco, cidade, estado,
+                    codigo_pix, created_by_user_id)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
     } satisfies Record<PersonKind, string>
 
     const result =
@@ -2152,6 +2224,9 @@ app.post(
             email || null,
             phone || null,
             cpfCnpj || null,
+            address || null,
+            city || null,
+            state?.toUpperCase() || null,
             pixCode || null,
             req.user!.userId,
           ])
@@ -2196,21 +2271,25 @@ app.patch(
       parsed.data.email || null,
       parsed.data.phone || null,
       parsed.data.cpfCnpj || null,
+      parsed.data.address || null,
+      parsed.data.city || null,
+      parsed.data.state?.toUpperCase() || null,
     ]
     const result =
       prefix === "prestador_servico"
         ? await pool.query(
             `UPDATE ${table}
              SET nome = $1, email = $2, telefone = $3, cpf_cnpj = $4,
-                 codigo_pix = $5
-             WHERE id = $6 AND created_by_user_id = $7
+                 endereco = $5, cidade = $6, estado = $7, codigo_pix = $8
+             WHERE id = $9 AND created_by_user_id = $10
              RETURNING id`,
             [...values, parsed.data.pixCode || null, id, req.user!.userId],
           )
         : await pool.query(
             `UPDATE ${table}
-             SET nome = $1, email = $2, telefone = $3, cpf_cnpj = $4
-             WHERE id = $5 AND created_by_user_id = $6
+             SET nome = $1, email = $2, telefone = $3, cpf_cnpj = $4,
+                 endereco = $5, cidade = $6, estado = $7
+             WHERE id = $8 AND created_by_user_id = $9
              RETURNING id`,
             [...values, id, req.user!.userId],
           )

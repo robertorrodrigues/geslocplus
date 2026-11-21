@@ -78,6 +78,9 @@ CREATE TABLE IF NOT EXISTS public.prepostos (
   email text,
   telefone text,
   cpf_cnpj text,
+  endereco text,
+  cidade text,
+  estado text,
   tipo text,
   status text
 );
@@ -87,7 +90,10 @@ CREATE TABLE IF NOT EXISTS public.prestadores_servico (
   nome text,
   email text,
   telefone text,
-  cpf_cnpj text
+  cpf_cnpj text,
+  endereco text,
+  cidade text,
+  estado text
 );
 
 CREATE TABLE IF NOT EXISTS public.proprietarios_adm (
@@ -95,7 +101,10 @@ CREATE TABLE IF NOT EXISTS public.proprietarios_adm (
   nome text NOT NULL,
   email text,
   telefone text,
-  cpf_cnpj text
+  cpf_cnpj text,
+  endereco text,
+  cidade text,
+  estado text
 );
 
 CREATE TABLE IF NOT EXISTS public.proprietarios_adm_imoveis (
@@ -232,14 +241,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_checklists_unique_owner_template
   WHERE modelo_padrao_id IS NOT NULL;
 
 ALTER TABLE public.proprietarios_adm
+  ADD COLUMN IF NOT EXISTS endereco text,
+  ADD COLUMN IF NOT EXISTS cidade text,
+  ADD COLUMN IF NOT EXISTS estado text,
   ADD COLUMN IF NOT EXISTS created_by_user_id bigint
   REFERENCES public.usuarios(id) ON DELETE CASCADE;
 
 ALTER TABLE public.prepostos
+  ADD COLUMN IF NOT EXISTS endereco text,
+  ADD COLUMN IF NOT EXISTS cidade text,
+  ADD COLUMN IF NOT EXISTS estado text,
   ADD COLUMN IF NOT EXISTS created_by_user_id bigint
   REFERENCES public.usuarios(id) ON DELETE CASCADE;
 
 ALTER TABLE public.prestadores_servico
+  ADD COLUMN IF NOT EXISTS endereco text,
+  ADD COLUMN IF NOT EXISTS cidade text,
+  ADD COLUMN IF NOT EXISTS estado text,
   ADD COLUMN IF NOT EXISTS created_by_user_id bigint
   REFERENCES public.usuarios(id) ON DELETE CASCADE;
 
